@@ -424,7 +424,14 @@ curated = (
         halal_status.alias("halal_status"),
         halal_reason.alias("halal_reason"),
     )
-    .withColumn("is_protein_source", F.col("protein_g_per_100g") >= F.lit(10.0))
+    # coalesce matters: NULL >= 10.0 is NULL in SQL, not false, and roughly
+    # 15% of OFF products have no protein figure. The column is NOT NULL, and
+    # a DEFAULT only applies when a column is omitted - not when NULL is
+    # passed explicitly. Unknown protein content means "not a protein source".
+    .withColumn(
+        "is_protein_source",
+        F.coalesce(F.col("protein_g_per_100g") >= F.lit(10.0), F.lit(False)),
+    )
     # Spices and oils must not scale linearly when a recipe is tripled.
     .withColumn(
         "scaling_class",
@@ -492,6 +499,28 @@ deduped = (
 
 rows = [r.asDict() for r in deduped.collect()]
 print(f"{len(rows)} deduplicated rows ready to upsert")
+
+# Pre-flight: fail loudly here rather than part-way through the batch with a
+# raw NotNullViolation. These are the NOT NULL columns in `ingredients` that
+# this notebook supplies explicitly (the ones it omits fall back to their
+# DEFAULT, which is why they're not listed).
+REQUIRED_NOT_NULL = [
+    "canonical_name", "halal_status", "is_protein_source", "scaling_class",
+]
+
+problems = {
+    col: sum(1 for r in rows if r.get(col) is None)
+    for col in REQUIRED_NOT_NULL
+}
+problems = {c: n for c, n in problems.items() if n}
+
+if problems:
+    example = next(r for r in rows if r.get(next(iter(problems))) is None)
+    raise ValueError(
+        f"NULLs in NOT NULL columns: {problems}\n"
+        f"example row: {example}"
+    )
+print(f"pre-flight OK - no NULLs in {', '.join(REQUIRED_NOT_NULL)}")
 
 # COMMAND ----------
 
