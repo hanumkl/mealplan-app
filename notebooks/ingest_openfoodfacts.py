@@ -57,6 +57,7 @@ dbutils.widgets.text("page_size", "1000", "api mode: products per request (max 1
 dbutils.widgets.text("max_pages", "10", "api mode: pages per country")
 dbutils.widgets.text("request_interval_seconds", "2", "api mode: seconds between requests")
 dbutils.widgets.text("max_retries", "4", "api mode: retries per page on 429/5xx")
+dbutils.widgets.text("staging_volume", "/Volumes/main/mealplan/raw", "api mode: Volume for raw JSON")
 dbutils.widgets.text("dump_path", "/Volumes/main/mealplan/off/food.parquet", "dump mode: Volume path")
 dbutils.widgets.text("lakebase_scope", "database", "Secret scope")
 dbutils.widgets.text("lakebase_key", "lakebase-url", "Secret key")
@@ -67,6 +68,7 @@ PAGE_SIZE = int(dbutils.widgets.get("page_size"))
 MAX_PAGES = int(dbutils.widgets.get("max_pages"))
 REQUEST_INTERVAL = float(dbutils.widgets.get("request_interval_seconds"))
 MAX_RETRIES = int(dbutils.widgets.get("max_retries"))
+STAGING_VOLUME = dbutils.widgets.get("staging_volume").rstrip("/")
 DUMP_PATH = dbutils.widgets.get("dump_path")
 
 LAKEBASE_URL = dbutils.secrets.get(
@@ -176,9 +178,30 @@ if SOURCE_MODE == "api":
             "source_mode to 'dump'."
         )
 
-    # json round-trip so Spark infers a stable schema across ragged records
-    raw_sdf = spark.read.json(spark.sparkContext.parallelize([json.dumps(r) for r in raw]))
-    print(f"\nfetched {raw_sdf.count()} products")
+    # Land the untouched payload in a Volume, then read it back with Spark.
+    #
+    # The obvious `spark.read.json(sc.parallelize(...))` doesn't work here:
+    # serverless compute blocks direct SparkContext access. Writing to a Volume
+    # first is the supported path - and it doubles as the immutable raw layer,
+    # so re-parsing never needs a re-fetch.
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    raw_path = f"{STAGING_VOLUME}/off_raw_{stamp}.jsonl"
+
+    try:
+        with open(raw_path, "w", encoding="utf-8") as fh:
+            for record in raw:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except (FileNotFoundError, OSError) as exc:
+        raise RuntimeError(
+            f"Could not write to {STAGING_VOLUME}. Create the Volume first "
+            f"(Catalog > your schema > Create volume), then set the "
+            f"staging_volume widget to its path. Original error: {exc}"
+        ) from exc
+
+    print(f"\nlanded raw payload -> {raw_path}")
+
+    raw_sdf = spark.read.json(raw_path)
+    print(f"fetched {raw_sdf.count()} products")
 
 else:
     # Full dump. Download once into a UC Volume, e.g. from

@@ -127,11 +127,19 @@ To redeploy after changes: pull in the Git folder, click Deploy again.
 
 ### 5. Run the pipelines
 
+**Create a Volume first** (Catalog → your schema → Create volume), e.g.
+`main.mealplan.raw`. Serverless compute blocks direct `SparkContext` access, so
+the notebook lands its raw JSON in a Volume and reads it back with Spark. That
+also gives you the immutable raw layer — re-parsing never needs a re-fetch.
+
 **Open Food Facts** — Workflows → Create Job → Notebook task pointing at
-`notebooks/ingest_openfoodfacts.py`. Defaults (`source_mode=api`,
-`countries=finland`) work with no extra setup. Check the Finnish product count
-in the notebook output; if it's thin, add `sweden,estonia` to the `countries`
-widget — those products are on Finnish shelves anyway.
+`notebooks/ingest_openfoodfacts.py`. Set `staging_volume` to the Volume you just
+created; the other defaults (`source_mode=api`, `countries=en:finland`) work as
+is. Roughly 10,000 Finnish products arrive in ~10 requests.
+
+Country tags need their language prefix — `en:finland`, not `finland`. To widen
+coverage, use `en:finland,en:sweden,en:estonia`; those products are on Finnish
+shelves anyway.
 
 **Receipts** — create a Volume (e.g. `main.mealplan.receipts`), upload 10–15
 receipt photos, set `vision_endpoint` to a vision-capable serving endpoint in
