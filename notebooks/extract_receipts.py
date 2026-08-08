@@ -29,7 +29,7 @@
 # COMMAND ----------
 
 dbutils.widgets.text("volume_path", "/Volumes/workspace/default/receipts", "Receipt volume (jpg/png/pdf)")
-dbutils.widgets.text("vision_endpoint", "databricks-claude-sonnet-4-5", "Vision serving endpoint")
+dbutils.widgets.text("vision_endpoint", "databricks-llama-4-maverick", "Vision serving endpoint")
 dbutils.widgets.text("default_store", "Prisma", "Store when the receipt doesn't say")
 dbutils.widgets.text("lakebase_scope", "database", "Secret scope")
 dbutils.widgets.text("lakebase_key", "lakebase-url", "Secret key")
@@ -234,7 +234,10 @@ def pdf_text_and_images(pdf_bytes: bytes) -> tuple[str, list[bytes]]:
     PyMuPDF is used rather than pdf2image because it needs no system packages -
     poppler isn't installed on serverless compute.
     """
-    import fitz  # PyMuPDF
+    try:
+        import pymupdf as fitz          # current name
+    except ImportError:
+        import fitz                     # older releases
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     text = "\n".join(page.get_text() for page in doc)
@@ -248,10 +251,49 @@ def pdf_text_and_images(pdf_bytes: bytes) -> tuple[str, list[bytes]]:
     return text, images
 
 
+class EndpointMissing(RuntimeError):
+    """The configured serving endpoint doesn't exist in this workspace."""
+
+
 def _call_model(content) -> dict:
     from databricks.sdk import WorkspaceClient
 
     client = WorkspaceClient().serving_endpoints.get_open_ai_client()
+    try:
+        return _do_call(client, content)
+    except Exception as exc:
+        # A wrong endpoint name fails identically on all 23 receipts. Stop on
+        # the first one and say what's actually available.
+        if "ENDPOINT_NOT_FOUND" in str(exc) or "404" in str(exc):
+            available = [e.name for e in WorkspaceClient().serving_endpoints.list()]
+            raise EndpointMissing(
+                f"Serving endpoint {VISION_ENDPOINT!r} does not exist in this "
+                f"workspace.\nAvailable: {', '.join(available)}\n"
+                f"Set the vision_endpoint widget to one of these - on Databricks "
+                f"Free Edition, 'databricks-llama-4-maverick' is the multimodal one."
+            ) from exc
+        raise
+
+
+def _do_call(client, content) -> dict:
+    import time as _time
+
+    # Free Edition throttles serving endpoints, and 23 sequential receipts can
+    # trip it. Back off rather than losing the rest of the batch.
+    for attempt in range(4):
+        try:
+            return _parse_response(client, content)
+        except Exception as exc:
+            if "429" in str(exc) or "rate limit" in str(exc).lower():
+                wait = 5 * (attempt + 1)
+                print(f"    rate limited, retrying in {wait}s")
+                _time.sleep(wait)
+                continue
+            raise
+    raise RuntimeError("rate limited on every retry")
+
+
+def _parse_response(client, content) -> dict:
     response = client.chat.completions.create(
         model=VISION_ENDPOINT,
         max_tokens=4096,
@@ -307,6 +349,8 @@ for row in pending:
         n = len(parsed.get("items", []))
         print(f"OK   {path.split('/')[-1]:36s} [{parsed.get('_mode','?'):16s}] "
               f"{n:3d} items  conf={parsed.get('confidence')}")
+    except EndpointMissing:
+        raise                      # configuration error - stop, don't retry 22 more
     except Exception as exc:
         parsed = {"_path": path, "_status": "failed", "_error": str(exc), "items": []}
         print(f"FAIL {path.split('/')[-1]:40s} {exc}")
