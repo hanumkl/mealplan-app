@@ -57,7 +57,7 @@ dbutils.widgets.text("page_size", "1000", "api mode: products per request (max 1
 dbutils.widgets.text("max_pages", "10", "api mode: pages per country")
 dbutils.widgets.text("request_interval_seconds", "2", "api mode: seconds between requests")
 dbutils.widgets.text("max_retries", "4", "api mode: retries per page on 429/5xx")
-dbutils.widgets.text("staging_volume", "/Volumes/main/mealplan/raw", "api mode: Volume for raw JSON")
+dbutils.widgets.text("staging_volume", "/Volumes/workspace/default/raw", "api mode: Volume for raw JSON")
 dbutils.widgets.text("dump_path", "/Volumes/main/mealplan/off/food.parquet", "dump mode: Volume path")
 dbutils.widgets.text("lakebase_scope", "database", "Secret scope")
 dbutils.widgets.text("lakebase_key", "lakebase-url", "Secret key")
