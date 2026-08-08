@@ -53,6 +53,7 @@ import re
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from pyspark.sql import functions as F
+from pyspark.sql import types as T
 from pyspark.sql.window import Window
 
 # COMMAND ----------
@@ -187,6 +188,30 @@ INSERT INTO receipt_line_items
 VALUES (%s, %s, %s, %s, %s, %s)
 """
 
+
+# A vision model returns free-form JSON, so anything it produces has to be
+# treated as untrusted input. One malformed date ("2026-13-45", "last Tuesday")
+# would otherwise abort the whole receipt batch.
+def safe_date(value):
+    from datetime import date
+
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (ValueError, TypeError):
+        print(f"    ignoring unparseable date: {value!r}")
+        return None
+
+
+def safe_number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
 receipt_ids = []
 with psycopg2.connect(LAKEBASE_URL) as conn:
     with conn.cursor() as cur:
@@ -194,11 +219,11 @@ with psycopg2.connect(LAKEBASE_URL) as conn:
             cur.execute(INSERT_RECEIPT, (
                 r["_path"],
                 r.get("store") or DEFAULT_STORE,
-                r.get("purchased_on"),
-                r.get("total_eur"),
+                safe_date(r.get("purchased_on")),
+                safe_number(r.get("total_eur")),
                 json.dumps(r),
                 r["_status"],
-                r.get("confidence"),
+                safe_number(r.get("confidence")),
             ))
             receipt_id = cur.fetchone()[0]
             receipt_ids.append(receipt_id)
@@ -206,11 +231,13 @@ with psycopg2.connect(LAKEBASE_URL) as conn:
             for item in r.get("items", []):
                 cur.execute(INSERT_LINE, (
                     receipt_id,
-                    item.get("raw_text", "")[:500],
-                    item.get("quantity"),
+                    str(item.get("raw_text") or "")[:500],
+                    safe_number(item.get("quantity")),
                     item.get("unit"),
-                    item.get("price_eur"),
-                    item.get("confidence", 0.5),
+                    safe_number(item.get("price_eur")),
+                    # .get(key, default) still returns None when the key exists
+                    # with a null value, which the model does emit.
+                    safe_number(item.get("confidence")) or 0.5,
                 ))
     conn.commit()
 
@@ -243,8 +270,48 @@ print(f"{len(line_rows)} unmatched lines vs {len(ing_rows)} catalog ingredients"
 # COMMAND ----------
 
 if line_rows and ing_rows:
-    lines_sdf = spark.createDataFrame(line_rows)
-    ings_sdf = spark.createDataFrame(ing_rows)
+    # Explicit schemas rather than inference. psycopg2 hands back Decimal for
+    # NUMERIC columns, and if a column happens to be entirely NULL in this
+    # batch (very common for `quantity`) Spark can't infer a type at all and
+    # createDataFrame fails outright.
+    line_schema = T.StructType([
+        T.StructField("line_id", T.IntegerType()),
+        T.StructField("raw_text", T.StringType()),
+        T.StructField("quantity", T.DoubleType()),
+        T.StructField("unit", T.StringType()),
+        T.StructField("price_eur", T.DoubleType()),
+        T.StructField("confidence", T.DoubleType()),
+        T.StructField("receipt_id", T.IntegerType()),
+    ])
+    ing_schema = T.StructType([
+        T.StructField("ingredient_id", T.IntegerType()),
+        T.StructField("canonical_name", T.StringType()),
+        T.StructField("name_fi", T.StringType()),
+    ])
+
+    def _clean(rows, fields):
+        """Decimal -> float so the declared schema accepts the values."""
+        out = []
+        for r in rows:
+            row = {}
+            for name, kind in fields:
+                v = r.get(name)
+                row[name] = float(v) if kind == "num" and v is not None else v
+            out.append(row)
+        return out
+
+    lines_sdf = spark.createDataFrame(
+        _clean(line_rows, [("line_id", "int"), ("raw_text", "str"),
+                           ("quantity", "num"), ("unit", "str"),
+                           ("price_eur", "num"), ("confidence", "num"),
+                           ("receipt_id", "int")]),
+        schema=line_schema,
+    )
+    ings_sdf = spark.createDataFrame(
+        _clean(ing_rows, [("ingredient_id", "int"), ("canonical_name", "str"),
+                          ("name_fi", "str")]),
+        schema=ing_schema,
+    )
 
     def normalise(col):
         """Strip pack sizes, punctuation and Finnish abbreviation dots."""
@@ -328,10 +395,21 @@ LEFT JOIN stores s ON s.name = r.store_hint
 WHERE r.receipt_id = %s
 """
 
+# ingredient_prices.price_eur and .confidence are both NOT NULL, and a vision
+# model will occasionally return a line with no price or an explicit null
+# confidence. Drop the priceless ones and default the confidence rather than
+# letting one bad line abort the whole batch.
+priced = [m for m in match_rows if m.get("price_eur") is not None]
+skipped = len(match_rows) - len(priced)
+if skipped:
+    print(f"skipping {skipped} matched lines with no price")
+
 written = 0
 with psycopg2.connect(LAKEBASE_URL) as conn:
     with conn.cursor() as cur:
-        for m in match_rows:
+        for m in priced:
+            if m.get("confidence") is None:
+                m["confidence"] = 0.5
             unit_price, basis = to_unit_price(m["quantity"], m["unit"], m["price_eur"])
             cur.execute("SELECT receipt_id FROM receipt_line_items WHERE line_id = %s",
                         (m["line_id"],))
