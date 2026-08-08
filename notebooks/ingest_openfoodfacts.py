@@ -314,13 +314,31 @@ def has_token(blob, tokens):
 
 
 def has_tag(col, *needles):
-    """True if any array element contains any needle (tags look like 'en:halal')."""
+    """True if any array element contains any needle (tags look like 'en:halal').
+
+    Substring matching, for vocabularies where the same concept appears with
+    different prefixes and spellings (`en:no-gluten` vs `en:gluten-free`).
+    """
     expr = F.lit(False)
     for needle in needles:
         expr = expr | F.exists(
             F.coalesce(col, F.array()),
             lambda x: F.lower(x).contains(needle),
         )
+    return expr
+
+
+def has_exact_tag(col, *values):
+    """True if the array contains any of these tags exactly.
+
+    Required for the vegan/vegetarian vocabularies, where substring matching
+    is actively wrong: `contains("vegan")` also matches `en:non-vegan` and
+    `en:vegan-status-unknown`, i.e. it would read "definitely not vegan" as
+    "vegan".
+    """
+    expr = F.lit(False)
+    for value in values:
+        expr = expr | F.array_contains(F.coalesce(col, F.array()), F.lit(value))
     return expr
 
 # COMMAND ----------
@@ -336,15 +354,132 @@ allergens = F.array_union(
 # in a "may contain" note.
 label_no_gluten = has_tag(labels, "no-gluten", "gluten-free")
 label_no_lactose = has_tag(labels, "no-lactose", "lactose-free")
-label_vegan = has_tag(labels, "vegan")
-label_vegetarian = has_tag(labels, "vegetarian") | label_vegan
 label_halal = has_tag(labels, "halal")
+label_vegan = has_exact_tag(labels, "en:vegan")
+label_vegetarian = has_exact_tag(labels, "en:vegetarian") | label_vegan
+
+# OFF computes its own vegan/vegetarian verdict from the parsed ingredient
+# list, independent of whether the producer applied a label. Ignoring this
+# was the single biggest cause of everything reading "unknown".
+analysis = arr_or_empty("ingredients_analysis_tags")
+analysis_vegan = has_exact_tag(analysis, "en:vegan")
+analysis_vegetarian = has_exact_tag(analysis, "en:vegetarian")
+
+is_vegan_flag = label_vegan | analysis_vegan
+is_vegetarian_flag = label_vegetarian | analysis_vegetarian | is_vegan_flag
 
 pork = has_token(ingredients_blob, PORK_TOKENS)
 gelatin = has_token(ingredients_blob, GELATIN_TOKENS)
 alcohol = has_token(ingredients_blob, ALCOHOL_TOKENS)
 carmine = has_token(ingredients_blob, CARMINE_TOKENS)
 flagged = pork | gelatin | alcohol | carmine
+
+# Note on what is deliberately NOT flagged: `en:non-vegan` and
+# `en:non-vegetarian` say nothing about halal status. Milk, eggs and properly
+# slaughtered beef are all non-vegan and all halal. Treating them as flagged
+# would reject most of the meat and dairy this household actually eats.
+
+# ---------------------------------------------------------------------------
+# Plain plant staples
+#
+# 62% of Finnish OFF records carry no labels, no analysis, no ingredients and
+# no category - just a name. That leaves rice, pasta and flour sitting at
+# "unknown", which is useless for planning. For single-ingredient plant foods
+# there is genuinely nothing to be uncertain about, so we infer from the name.
+#
+# This is guarded hard, because a wrong "likely_ok" on a halal filter is much
+# worse than a wrong "unknown": the name must contain a staple word AND must
+# not contain any animal, seafood, or prepared-dish word. That keeps
+# "Basmatiriisi" while rejecting "Riisi ja kana" and "Kebab riisillä".
+# ---------------------------------------------------------------------------
+STAPLE_TOKENS = [
+    "riisi", "rice", "basmati", "jasmiini", "pasta", "makaroni", "spagetti",
+    "spaghetti", "nuudeli", "noodle", "couscous", "bulgur", "quinoa",
+    "penne", "fusilli", "tagliatelle", "lasagne", "farfalle", "risotto",
+    "jauho", "flour", "kaura", "oat", "hirssi", "tattari", "mannasuurimo",
+    "linssi", "lentil", "papu", "bean", "herne", "pea", "kikherne", "chickpea",
+    "peruna", "potato", "porkkana", "carrot", "tomaatti", "tomato",
+    "sipuli", "onion", "valkosipuli", "garlic", "kurkku", "cucumber",
+    "paprika", "parsakaali", "broccoli", "pinaatti", "spinach", "kaali",
+    "omena", "apple", "banaani", "banana", "appelsiini", "orange",
+    "sokeri", "sugar", "suola", "salt",
+]
+
+# Words that may appear alongside a staple without changing what it is:
+# brand-ish qualifiers, sizes, and quality adjectives.
+SAFE_MODIFIERS = [
+    "xtra", "extra", "luomu", "organic", "premium", "classic", "original",
+    "iso", "isot", "pieni", "suuri", "taysjyva", "valkoinen", "tumma",
+    "gluteeniton", "laktoositon", "maustamaton", "kuivattu", "pikA",
+    "kotimainen", "puhdas", "natural", "naturell", "fin", "hieno", "karkea",
+    "ja", "and", "of", "the", "with",
+]
+
+# Still used as a hard veto, with plain substring matching (not word-boundary):
+# Finnish compounds words without spaces, so "pastakastike" hides "kastike"
+# and "shrimps" hides "shrimp". Over-rejecting here is free - the product just
+# stays "unknown", which is where it already was.
+NON_STAPLE_TOKENS = [
+    "kana", "chicken", "liha", "meat", "nauta", "beef", "possu", "sika",
+    "kala", "fish", "lohi", "salmon", "tonnikala", "tuna", "katkarapu",
+    "shrimp", "ayriai", "kebab", "makkara", "sausage", "nakki", "pekoni",
+    "kinkku", "broileri", "kalkkuna", "turkey", "muna", "egg",
+    "juusto", "cheese", "kerma", "cream", "maito", "milk", "jogurtti",
+    "kastike", "sauce", "keitto", "soup", "ateria", "carbonara", "bolognese",
+    "valmis", "pizza", "burger", "wok", "curry", "salaatti", "salad",
+    "puuro", "porridge", "leipa", "bread", "piirakka", "pulla", "kakku",
+]
+
+
+def has_substring(blob, tokens):
+    """Plain substring match - deliberately aggressive, for the veto list."""
+    expr = F.lit(False)
+    for tok in tokens:
+        expr = expr | blob.contains(tok)
+    return expr
+
+
+name_lower = F.lower(F.col("canonical_name"))
+
+# Whitelist rather than blocklist. A blocklist can't enumerate every dish name
+# on earth - "Pasta carbonara" passed one until it was spotted. Instead every
+# word must be recognisable: a staple, a harmless modifier, or a size like
+# "500g". One unknown word ("carbonara", "kebab", "shrimps") blocks inference.
+name_words = F.filter(
+    F.split(F.regexp_replace(name_lower, r"[^\w\s]", " "), r"\s+"),
+    lambda w: F.length(w) > 0,
+)
+
+
+def _word_is_staple(w):
+    expr = F.lit(False)
+    for tok in STAPLE_TOKENS:
+        expr = expr | w.contains(tok)
+    return expr
+
+
+def _word_is_modifier(w):
+    expr = w.rlike(r"^\d+[a-z]{0,2}$")           # 500g, 1kg, 5
+    for tok in SAFE_MODIFIERS:
+        expr = expr | (w == F.lit(tok))
+    return expr
+
+
+# `flagged` above is derived from the ingredient list, which these bare records
+# don't have - so the name has to be screened separately. Without this,
+# "Chorizopasta" reads as a plain pasta staple: one word, contains "pasta",
+# no ingredient data to contradict it.
+name_has_haram = has_substring(
+    name_lower, PORK_TOKENS + GELATIN_TOKENS + ALCOHOL_TOKENS + CARMINE_TOKENS
+)
+
+plant_staple = (
+    F.exists(name_words, _word_is_staple)
+    & F.forall(name_words, lambda w: _word_is_staple(w) | _word_is_modifier(w))
+    & ~has_substring(name_lower, NON_STAPLE_TOKENS)
+    & ~name_has_haram
+    & ~flagged
+)
 
 halal_reason = (
     F.when(label_halal, F.lit("explicit halal label"))
@@ -354,13 +489,17 @@ halal_reason = (
      .when(carmine, F.lit("carmine / E120 found"))
      .when(label_vegan, F.lit("vegan label, nothing flagged"))
      .when(label_vegetarian, F.lit("vegetarian label, nothing flagged"))
-     .otherwise(F.lit("no label and no flagged ingredient - unverified"))
+     .when(analysis_vegan, F.lit("ingredients analysed as vegan"))
+     .when(analysis_vegetarian, F.lit("ingredients analysed as vegetarian"))
+     .when(plant_staple, F.lit("plain plant staple inferred from product name"))
+     .otherwise(F.lit("no label, ingredients or category in Open Food Facts"))
 )
 
 halal_status = (
     F.when(label_halal, F.lit("certified"))
      .when(flagged, F.lit("contains_flagged"))
-     .when(label_vegetarian, F.lit("likely_ok"))
+     .when(is_vegetarian_flag, F.lit("likely_ok"))
+     .when(plant_staple, F.lit("likely_ok"))
      .otherwise(F.lit("unknown"))
 )
 
@@ -401,7 +540,16 @@ curated = (
         F.col("code").cast("string").alias("off_code"),
         F.col("canonical_name"),
         F.trim(col_or_null("product_name_fi")).alias("name_fi"),
+        F.trim(col_or_null("product_name_en")).alias("name_en"),
         category.alias("category"),
+        # OFF category tags are always English regardless of the product's
+        # language, so "Grillattu broileri" still yields "roast chicken".
+        # For a Finnish catalogue you can't read, that's often the only clue
+        # to what the thing actually is.
+        F.when(
+            category.isNotNull(),
+            F.regexp_replace(F.regexp_replace(category, r"^[a-z]{2}:", ""), "-", " "),
+        ).alias("category_en"),
         store_name.alias("store_name"),
 
         nutriment("energy-kcal_100g").alias("kcal_per_100g"),
@@ -409,8 +557,8 @@ curated = (
         nutriment("carbohydrates_100g").alias("carb_g_per_100g"),
         nutriment("fat_100g").alias("fat_g_per_100g"),
 
-        label_vegetarian.alias("is_vegetarian"),
-        label_vegan.alias("is_vegan"),
+        is_vegetarian_flag.alias("is_vegetarian"),
+        is_vegan_flag.alias("is_vegan"),
         pork.alias("contains_pork"),
         alcohol.alias("contains_alcohol"),
         # An explicit "free from" label beats a token match.
@@ -529,7 +677,7 @@ from psycopg2.extras import execute_values
 
 UPSERT_SQL = """
 INSERT INTO ingredients (
-    canonical_name, name_fi, category, off_code,
+    canonical_name, name_fi, name_en, category, category_en, off_code,
     kcal_per_100g, protein_g_per_100g, carb_g_per_100g, fat_g_per_100g,
     is_vegetarian, is_vegan, contains_pork, contains_alcohol,
     contains_gluten, contains_lactose, contains_nuts,
@@ -538,7 +686,9 @@ INSERT INTO ingredients (
 ) VALUES %s
 ON CONFLICT (canonical_name) DO UPDATE SET
     name_fi            = COALESCE(EXCLUDED.name_fi, ingredients.name_fi),
+    name_en            = COALESCE(EXCLUDED.name_en, ingredients.name_en),
     category           = COALESCE(EXCLUDED.category, ingredients.category),
+    category_en        = COALESCE(EXCLUDED.category_en, ingredients.category_en),
     off_code           = COALESCE(EXCLUDED.off_code, ingredients.off_code),
     kcal_per_100g      = COALESCE(EXCLUDED.kcal_per_100g, ingredients.kcal_per_100g),
     protein_g_per_100g = COALESCE(EXCLUDED.protein_g_per_100g, ingredients.protein_g_per_100g),
@@ -552,7 +702,7 @@ ON CONFLICT (canonical_name) DO UPDATE SET
 # Named placeholders so we can hand execute_values the row dicts directly -
 # no need to reorder each row into a tuple by hand.
 VALUE_TEMPLATE = """(
-    %(canonical_name)s, %(name_fi)s, %(category)s, %(off_code)s,
+    %(canonical_name)s, %(name_fi)s, %(name_en)s, %(category)s, %(category_en)s, %(off_code)s,
     %(kcal_per_100g)s, %(protein_g_per_100g)s, %(carb_g_per_100g)s, %(fat_g_per_100g)s,
     %(is_vegetarian)s, %(is_vegan)s, %(contains_pork)s, %(contains_alcohol)s,
     %(contains_gluten)s, %(contains_lactose)s, %(contains_nuts)s,

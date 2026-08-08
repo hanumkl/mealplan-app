@@ -357,11 +357,13 @@ def search_ingredients():
             ) p ON TRUE
             WHERE i.canonical_name ILIKE %s
                OR i.name_fi ILIKE %s
+               OR i.name_en ILIKE %s
                OR i.name_id ILIKE %s
+               OR i.category_en ILIKE %s
             ORDER BY i.canonical_name
             LIMIT %s
             """,
-            (f"%{q}%", f"%{q}%", f"%{q}%", limit),
+            (f"%{q}%",) * 5 + (limit,),
         )
     else:
         rows = run_query(

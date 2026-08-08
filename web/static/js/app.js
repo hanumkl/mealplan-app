@@ -409,6 +409,20 @@ async function loadCatalog() {
     return;
   }
 
+  // The catalogue is Finnish. Show whatever English we have underneath the
+  // product name: OFF's English name when it exists, otherwise the category
+  // tag, which is always English ("Grillattu broileri" -> "roast chicken").
+  const englishHint = (r) => {
+    const name = (r.canonical_name || "").toLowerCase();
+    if (r.name_en && r.name_en.toLowerCase() !== name) {
+      return `<div class="faint" style="font-size:11.5px">🇬🇧 ${esc(r.name_en)}</div>`;
+    }
+    if (r.category_en) {
+      return `<div class="faint" style="font-size:11.5px">≈ ${esc(r.category_en)}</div>`;
+    }
+    return "";
+  };
+
   const halalBadge = (s) => ({
     certified: `<span class="badge ok">certified</span>`,
     likely_ok: `<span class="badge ok">likely ok</span>`,
@@ -430,9 +444,9 @@ async function loadCatalog() {
             <tr>
               <td>
                 <div style="font-weight:560">${esc(r.canonical_name)}</div>
-                ${r.name_fi ? `<div class="faint" style="font-size:11.5px">${esc(r.name_fi)}</div>` : ""}
+                ${englishHint(r)}
               </td>
-              <td class="muted">${esc(r.category || "—")}</td>
+              <td class="muted">${esc(r.category_en || r.category || "—")}</td>
               <td class="num">${num(r.kcal_per_100g)}</td>
               <td class="num">${num(r.protein_g_per_100g, 1)} g</td>
               <td>${halalBadge(r.halal_status)}</td>
