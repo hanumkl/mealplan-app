@@ -178,11 +178,20 @@ print("columns:", sorted(raw_sdf.columns))
 
 
 def iso8601_minutes(col):
-    """PT1H23M45S -> 83. contentDetails.duration is always this format."""
-    hours = F.coalesce(F.regexp_extract(col, r"(\d+)H", 1).cast("int"), F.lit(0))
-    mins = F.coalesce(F.regexp_extract(col, r"(\d+)M", 1).cast("int"), F.lit(0))
-    secs = F.coalesce(F.regexp_extract(col, r"(\d+)S", 1).cast("int"), F.lit(0))
-    return hours * 60 + mins + (secs / 60.0)
+    """PT1H23M45S -> 83. contentDetails.duration is always this format.
+
+    regexp_extract returns an empty string when the pattern doesn't match, not
+    NULL - so coalesce never fires, and under ANSI mode (on by default here)
+    casting '' to int raises CAST_INVALID_INPUT instead of yielding NULL. Most
+    cooking videos are under an hour, so the missing 'H' group breaks nearly
+    every row. The empty string has to be turned into NULL first, and the
+    `when` short-circuits so the bad cast is never evaluated.
+    """
+    def part(pattern):
+        raw = F.regexp_extract(col, pattern, 1)
+        return F.coalesce(F.when(raw != F.lit(""), raw.cast("int")), F.lit(0))
+
+    return part(r"(\d+)H") * 60 + part(r"(\d+)M") + (part(r"(\d+)S") / 60.0)
 
 
 candidates = (
