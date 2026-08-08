@@ -454,7 +454,32 @@ if line_rows and ing_rows:
     print(f"matched {len(match_rows)} / {len(line_rows)} lines")
 else:
     match_rows = []
-    print("nothing to match - run ingest_openfoodfacts.py first")
+    # Say which side is actually empty - these have very different causes.
+    if not ing_rows:
+        print("no ingredients in the catalogue - run ingest_openfoodfacts.py first")
+    else:
+        with psycopg2.connect(LAKEBASE_URL, cursor_factory=RealDictCursor) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                      (SELECT count(*) FROM raw_receipts)                            AS receipts,
+                      (SELECT count(*) FROM raw_receipts WHERE extraction_status='extracted') AS extracted,
+                      (SELECT count(*) FROM raw_receipts WHERE extraction_status='failed')    AS failed,
+                      (SELECT count(*) FROM receipt_line_items)                      AS line_items,
+                      (SELECT count(*) FROM receipt_line_items WHERE match_status='unmatched') AS unmatched
+                """)
+                d = dict(cur.fetchone())
+        print(f"no unmatched receipt lines to match. {ing_rows and len(ing_rows)} ingredients exist, so:")
+        print(f"  receipts rows:   {d['receipts']} "
+              f"({d['extracted']} extracted, {d['failed']} failed)")
+        print(f"  line items:      {d['line_items']} ({d['unmatched']} unmatched)")
+        if d["receipts"] == 0:
+            print("  -> no receipts were written. Did section 3 run?")
+        elif d["line_items"] == 0:
+            print("  -> receipts exist but produced no line items. Inspect the model "
+                  "output:  SELECT image_path, extraction_status, payload FROM raw_receipts;")
+        else:
+            print("  -> every line is already matched; nothing new to do.")
 
 # COMMAND ----------
 
