@@ -27,9 +27,9 @@ target.
 
 Mirrors the bootcamp's three days. Each stage ends in something demoable.
 
-- **Stage 1 — App + Lakebase** ← *you are here*
+- **Stage 1 — App + Lakebase** ✅
   Household setup, ingredient catalog, price provenance, pipeline status.
-- **Stage 2 — Context engineering + vectors**
+- **Stage 2 — Context engineering + vectors** ← *you are here*
   pgvector in Lakebase, YouTube recipe harvest, LLM ingredient extraction,
   semantic recipe search.
 - **Stage 3 — Agent**
@@ -144,6 +144,37 @@ shelves anyway.
 **Receipts** — create a Volume (e.g. `main.mealplan.receipts`), upload 10–15
 receipt photos, set `vision_endpoint` to a vision-capable serving endpoint in
 your workspace, and run `notebooks/extract_receipts.py`.
+
+On Databricks Free Edition there are no Claude models; `databricks-llama-4-maverick`
+is the only multimodal endpoint, and it is the default. Text-layer PDFs skip the
+vision path entirely and are read exactly.
+
+### 6. Stage 2 — vectors and recipes
+
+1. Run `sql/07_vectors.sql`. It needs the `vector` extension, which Lakebase
+   provides — `CREATE EXTENSION IF NOT EXISTS vector` is the first statement.
+2. Get a **YouTube Data API v3** key (Google Cloud Console → enable the API →
+   create an API key) and store it as `mealplan/youtube-api-key`.
+3. Run `notebooks/harvest_youtube_recipes.py`. Searching costs 100 quota units
+   a call against a 10,000/day budget, so it harvests once and serves from
+   Postgres — never search at request time.
+4. Run `notebooks/embed_content.py`. It reads the `*_needing_embedding` views,
+   so re-running only embeds what's new.
+5. Redeploy the app. The **Recipes** tab lights up.
+
+**The one rule for embeddings:** content and query must use the *same* model.
+Two models produce vectors of the same length that mean different things —
+nothing errors, the results are just silently meaningless. `/api/search/status`
+checks for this and the search endpoints return a `warning` if they disagree.
+
+The app embeds queries in-process with
+`paraphrase-multilingual-MiniLM-L12-v2` (384-dim). Multilingual is the whole
+point here: the catalog is Finnish, the recipes are Indonesian, the household
+types English, and an English-only model embeds *Broilerin fileesuikale* as
+near-noise. That needs torch in the app image; if it can't load, search falls
+back to keyword matching rather than failing, and `/api/search/status` says why.
+To use a Databricks embedding endpoint instead, see the header of
+`web/embeddings.py` — it's a four-step switch, all of it or none.
 
 ---
 

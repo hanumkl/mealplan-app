@@ -31,10 +31,12 @@
         <span class="ico">📊</span> Pipeline
       </button>
 
-      <div class="nav-label" style="margin-top:16px">Coming next</div>
-      <button class="nav-item disabled" disabled>
-        <span class="ico">🔍</span> Recipes <span class="stage-tag">S2</span>
+      <div class="nav-label" style="margin-top:16px">Stage 2</div>
+      <button class="nav-item" data-view="recipes">
+        <span class="ico">🔍</span> Recipes
       </button>
+
+      <div class="nav-label" style="margin-top:16px">Coming next</div>
       <button class="nav-item disabled" disabled>
         <span class="ico">📅</span> Week plan <span class="stage-tag">S3</span>
       </button>
@@ -105,6 +107,39 @@
         </p>
       </div>
       <div id="pipeline-body"></div>
+    </section>
+
+    <!-- ============================= RECIPES ============================= -->
+    <section id="view-recipes" class="hidden">
+      <div class="page-head">
+        <h1 class="page-title">Recipes</h1>
+        <p class="page-sub">
+          Recipes harvested from YouTube, with ingredients extracted by an LLM.
+          Search is semantic — “something warming with chicken” finds dishes that
+          never use those words, in Finnish or Indonesian.
+        </p>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="form-row" style="grid-template-columns: 1fr auto">
+          <input type="text" id="recipe-search"
+                 placeholder="Describe a meal — spicy coconut chicken, quick weeknight rice…">
+          <button class="btn btn-primary" id="btn-recipe-search">Search</button>
+        </div>
+        <div class="filter-row">
+          <label class="check">
+            <input type="checkbox" id="rf-household" checked>
+            Respect our strict restrictions
+          </label>
+          <label class="check">
+            <input type="checkbox" id="rf-approved">
+            Approved only
+          </label>
+          <span class="faint" id="recipe-mode"></span>
+        </div>
+      </div>
+
+      <div id="recipes-body"></div>
     </section>
 
   </main>
@@ -300,6 +335,18 @@
       <button type="submit" class="btn btn-primary">Save</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="recipe-dialog" class="dialog-wide">
+  <div class="dialog-head">
+    <span id="recipe-dialog-title">Recipe</span>
+  </div>
+  <div class="dialog-body" id="recipe-dialog-body"></div>
+  <div class="dialog-foot">
+    <button type="button" class="btn btn-ghost btn-danger" id="recipe-reject">Reject</button>
+    <button type="button" class="btn btn-ghost" data-close>Close</button>
+    <button type="button" class="btn btn-primary" id="recipe-approve">Approve for planning</button>
+  </div>
 </dialog>
 
 <div class="toast-host" id="toasts"></div>

@@ -21,8 +21,9 @@ try:
 except ImportError:
     pass
 
+import embeddings
 from lakebase import run_one, run_query, run_returning, run_write
-from nutrition import calculate_targets
+from nutrition import calculate_targets, scale_quantity
 
 app = Flask(__name__)
 
@@ -509,6 +510,363 @@ def list_stores():
 
 
 # --------------------------------------------------------------------------
+# recipes + semantic search (Stage 2)
+# --------------------------------------------------------------------------
+
+# Strict restrictions map onto columns the harvest notebook derives. Anything
+# not listed here can't be enforced in SQL and is left to the Stage 3 agent.
+RESTRICTION_FILTERS = {
+    "vegetarian":   "r.is_vegetarian IS TRUE",
+    "vegan":        "r.is_vegan IS TRUE",
+    "halal":        "r.contains_pork IS NOT TRUE AND r.halal_status <> 'contains_flagged'",
+    "no_pork":      "r.contains_pork IS NOT TRUE",
+    "gluten_free":  "r.contains_gluten IS NOT TRUE",
+    "lactose_free": "r.contains_lactose IS NOT TRUE",
+}
+
+
+def _strict_restriction_sql(household_id: int) -> tuple[list[str], list[str]]:
+    """SQL predicates for a household's strict restrictions.
+
+    Returns (clauses, ignored) - `ignored` names restrictions with no column to
+    filter on, so the UI can say so instead of implying the list is safe.
+    """
+    rows = run_query(
+        """
+        SELECT DISTINCT r.restriction
+        FROM member_restrictions r
+        JOIN members m ON m.member_id = r.member_id
+        WHERE m.household_id = %s AND r.severity = 'strict'
+        """,
+        (household_id,),
+    )
+    clauses, ignored = [], []
+    for row in rows:
+        key = row["restriction"]
+        if key in RESTRICTION_FILTERS:
+            clauses.append(RESTRICTION_FILTERS[key])
+        else:
+            ignored.append(key)
+    return clauses, ignored
+
+
+def _embedding_model_warning(table: str) -> str | None:
+    """Detect a query/content model mismatch.
+
+    If the notebook embedded with model A and the app queries with model B, the
+    vectors are the same length so nothing errors - the results are just
+    silently meaningless. That is the worst kind of bug, so it is checked
+    explicitly and surfaced in the response.
+    """
+    try:
+        rows = run_query(f"SELECT DISTINCT model_name FROM {table}")
+    except Exception:
+        return None
+    stored = {r["model_name"] for r in rows if r.get("model_name")}
+    if stored and embeddings.ACTIVE_MODEL not in stored:
+        return (
+            f"{table} was embedded with {', '.join(sorted(stored))} but this app "
+            f"queries with {embeddings.ACTIVE_MODEL}. Results are not "
+            f"meaningful until both use the same model - re-run "
+            f"notebooks/embed_content.py with reembed_all=true."
+        )
+    return None
+
+
+@app.get("/api/recipes")
+def list_recipes():
+    """Browse the recipe catalogue. Keyword filter, no embeddings required."""
+    q = (request.args.get("q") or "").strip()
+    limit = min(int(request.args.get("limit", 50)), 200)
+    status = request.args.get("review_status")
+    cuisine = request.args.get("cuisine")
+    household_id = request.args.get("household_id", type=int)
+
+    where, params = [], []
+    if q:
+        where.append("(r.title ILIKE %s OR r.cuisine ILIKE %s OR r.description ILIKE %s)")
+        params += [f"%{q}%"] * 3
+    if status in ("pending", "approved", "rejected"):
+        where.append("r.review_status = %s")
+        params.append(status)
+    if cuisine:
+        where.append("r.cuisine ILIKE %s")
+        params.append(cuisine)
+
+    ignored: list[str] = []
+    if household_id:
+        clauses, ignored = _strict_restriction_sql(household_id)
+        where += clauses
+
+    sql = """
+        SELECT r.*,
+               (SELECT COUNT(*) FROM recipe_ingredients ri
+                 WHERE ri.recipe_id = r.recipe_id) AS ingredient_count
+        FROM recipes r
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY r.extraction_confidence DESC NULLS LAST, r.recipe_id DESC LIMIT %s"
+    params.append(limit)
+
+    return jsonify({
+        "results": run_query(sql, tuple(params)),
+        "unenforced_restrictions": ignored,
+    })
+
+
+@app.get("/api/recipes/search")
+def semantic_recipe_search():
+    """Semantic search over recipe_embeddings.
+
+    Falls back to keyword search when the embedding model can't load, because a
+    degraded search beats a 500 - the app stays usable on a box without torch.
+    """
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return bad_request("q is required")
+    limit = min(int(request.args.get("limit", 10)), 50)
+    household_id = request.args.get("household_id", type=int)
+    approved_only = request.args.get("approved_only", "false").lower() == "true"
+
+    total = run_one("SELECT COUNT(*) AS n FROM recipe_embeddings")
+    if not total or total["n"] == 0:
+        return jsonify({
+            "query": q, "mode": "unavailable", "results": [],
+            "message": "No recipe embeddings yet. Run notebooks/harvest_youtube_"
+                       "recipes.py then notebooks/embed_content.py.",
+        })
+
+    where, params = [], []
+    ignored: list[str] = []
+    if household_id:
+        clauses, ignored = _strict_restriction_sql(household_id)
+        where += clauses
+    if approved_only:
+        where.append("r.review_status = 'approved'")
+    filter_sql = (" AND " + " AND ".join(where)) if where else ""
+
+    if not embeddings.available():
+        rows = run_query(
+            f"""
+            SELECT r.*, NULL::float AS similarity
+            FROM recipes r
+            WHERE (r.title ILIKE %s OR r.description ILIKE %s){filter_sql}
+            ORDER BY r.extraction_confidence DESC NULLS LAST
+            LIMIT %s
+            """,
+            tuple([f"%{q}%", f"%{q}%"] + params + [limit]),
+        )
+        return jsonify({
+            "query": q, "mode": "keyword-fallback", "results": rows,
+            "unenforced_restrictions": ignored,
+            "message": "Embedding model unavailable; showing keyword matches.",
+        })
+
+    vec = embeddings.vector_literal(embeddings.embed_query(q))
+    rows = run_query(
+        f"""
+        SELECT r.recipe_id, r.title, r.cuisine, r.video_url, r.thumbnail_url,
+               r.channel_title, r.duration_min, r.base_servings, r.description,
+               r.is_vegetarian, r.is_vegan, r.contains_pork, r.contains_gluten,
+               r.contains_lactose, r.halal_status, r.extraction_confidence,
+               r.review_status,
+               1 - (e.embedding <=> %s::vector) AS similarity
+        FROM recipe_embeddings e
+        JOIN recipes r ON r.recipe_id = e.recipe_id
+        WHERE TRUE{filter_sql}
+        ORDER BY e.embedding <=> %s::vector
+        LIMIT %s
+        """,
+        tuple([vec] + params + [vec, limit]),
+    )
+    return jsonify({
+        "query": q,
+        "mode": "semantic",
+        "model": embeddings.ACTIVE_MODEL,
+        "results": rows,
+        "unenforced_restrictions": ignored,
+        "warning": _embedding_model_warning("recipe_embeddings"),
+    })
+
+
+@app.get("/api/recipes/<int:recipe_id>")
+def recipe_detail(recipe_id: int):
+    """Full recipe, with ingredients scaled to the requested servings."""
+    recipe = run_one("SELECT * FROM recipes WHERE recipe_id = %s", (recipe_id,))
+    if recipe is None:
+        return jsonify({"error": "recipe not found"}), 404
+
+    base = float(recipe.get("base_servings") or 4)
+    servings = request.args.get("servings", type=float)
+    factor = (servings / base) if servings and base else 1.0
+
+    ingredients = run_query(
+        """
+        SELECT ri.*, i.canonical_name, i.name_en, i.name_fi, i.halal_status,
+               p.unit_price_eur, p.unit_basis, p.store_name
+        FROM recipe_ingredients ri
+        LEFT JOIN ingredients i ON i.ingredient_id = ri.ingredient_id
+        LEFT JOIN LATERAL (
+            SELECT * FROM latest_ingredient_prices lp
+            WHERE lp.ingredient_id = ri.ingredient_id
+            ORDER BY lp.unit_price_eur NULLS LAST
+            LIMIT 1
+        ) p ON TRUE
+        WHERE ri.recipe_id = %s
+        ORDER BY ri.sort_order, ri.ri_id
+        """,
+        (recipe_id,),
+    )
+    for row in ingredients:
+        qty = row.get("quantity")
+        row["scaled_quantity"] = (
+            None if qty is None
+            else round(scale_quantity(float(qty), factor, row["scaling_class"]), 2)
+        )
+
+    return jsonify({
+        "recipe": recipe,
+        "ingredients": ingredients,
+        "servings": servings or base,
+        "base_servings": base,
+        "scale_factor": round(factor, 3),
+    })
+
+
+@app.get("/api/recipes/<int:recipe_id>/steps")
+def recipe_step_search(recipe_id: int):
+    """Search this recipe's step chunks - 'when do I add the coconut milk?'
+
+    Returns `start_second` so the UI can deep-link into the video at the moment
+    the step happens, which is the point of chunking with timestamps.
+    """
+    q = (request.args.get("q") or "").strip()
+    limit = min(int(request.args.get("limit", 5)), 20)
+
+    if not q:
+        return jsonify({"results": run_query(
+            """
+            SELECT chunk_id, chunk_index, chunk_text, start_second
+            FROM recipe_chunk_embeddings
+            WHERE recipe_id = %s
+            ORDER BY chunk_index
+            """,
+            (recipe_id,),
+        ), "mode": "all"})
+
+    if not embeddings.available():
+        return jsonify({
+            "results": [], "mode": "unavailable",
+            "message": "Embedding model unavailable; step search needs it.",
+        })
+
+    vec = embeddings.vector_literal(embeddings.embed_query(q))
+    return jsonify({
+        "mode": "semantic",
+        "results": run_query(
+            """
+            SELECT chunk_id, chunk_index, chunk_text, start_second,
+                   1 - (embedding <=> %s::vector) AS similarity
+            FROM recipe_chunk_embeddings
+            WHERE recipe_id = %s
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+            """,
+            (vec, recipe_id, vec, limit),
+        ),
+    })
+
+
+@app.put("/api/recipes/<int:recipe_id>/review")
+def review_recipe(recipe_id: int):
+    """Approve or reject an LLM-extracted recipe. Only approved recipes are
+    plannable, so this is the human gate on imperfect extraction."""
+    status = body().get("review_status")
+    if status not in ("pending", "approved", "rejected"):
+        return bad_request("review_status must be pending, approved or rejected")
+    row = run_returning(
+        "UPDATE recipes SET review_status = %s WHERE recipe_id = %s RETURNING *",
+        (status, recipe_id),
+    )
+    if row is None:
+        return jsonify({"error": "recipe not found"}), 404
+    return jsonify(row)
+
+
+@app.get("/api/search/ingredients")
+def semantic_ingredient_search():
+    """Semantic search over the Finnish catalogue - 'chicken' finds 'Broilerin
+    fileesuikale'. This is what makes an English-speaking household able to use
+    a Finnish grocery catalogue at all."""
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return bad_request("q is required")
+    limit = min(int(request.args.get("limit", 10)), 50)
+
+    total = run_one("SELECT COUNT(*) AS n FROM ingredient_embeddings")
+    if not total or total["n"] == 0:
+        return jsonify({
+            "query": q, "mode": "unavailable", "results": [],
+            "message": "No ingredient embeddings yet. Run notebooks/embed_content.py.",
+        })
+    if not embeddings.available():
+        return jsonify({
+            "query": q, "mode": "unavailable", "results": [],
+            "message": "Embedding model unavailable.",
+        })
+
+    vec = embeddings.vector_literal(embeddings.embed_query(q))
+    rows = run_query(
+        """
+        SELECT i.ingredient_id, i.canonical_name, i.name_fi, i.name_en,
+               i.category_en, i.halal_status, i.halal_source, i.is_protein_source,
+               p.unit_price_eur, p.unit_basis, p.store_name,
+               1 - (e.embedding <=> %s::vector) AS similarity
+        FROM ingredient_embeddings e
+        JOIN ingredients i ON i.ingredient_id = e.ingredient_id
+        LEFT JOIN LATERAL (
+            SELECT * FROM latest_ingredient_prices lp
+            WHERE lp.ingredient_id = i.ingredient_id
+            ORDER BY lp.unit_price_eur NULLS LAST
+            LIMIT 1
+        ) p ON TRUE
+        ORDER BY e.embedding <=> %s::vector
+        LIMIT %s
+        """,
+        (vec, vec, limit),
+    )
+    return jsonify({
+        "query": q,
+        "mode": "semantic",
+        "model": embeddings.ACTIVE_MODEL,
+        "results": rows,
+        "warning": _embedding_model_warning("ingredient_embeddings"),
+    })
+
+
+@app.get("/api/search/status")
+def search_status():
+    """Whether semantic search is actually usable, and why not if it isn't."""
+    counts = {}
+    for table in ("ingredient_embeddings", "recipe_embeddings",
+                  "recipe_chunk_embeddings", "cooking_log_embeddings"):
+        try:
+            counts[table] = run_one(f"SELECT COUNT(*) AS n FROM {table}")["n"]
+        except Exception as exc:
+            counts[table] = f"missing ({exc.__class__.__name__}) - run sql/07_vectors.sql"
+    return jsonify({
+        "model": embeddings.ACTIVE_MODEL,
+        "model_loaded": embeddings.available(),
+        "embedding_counts": counts,
+        "warnings": [w for w in (
+            _embedding_model_warning("recipe_embeddings"),
+            _embedding_model_warning("ingredient_embeddings"),
+        ) if w],
+    })
+
+
+# --------------------------------------------------------------------------
 # pipeline status - proves the Spark jobs actually landed data
 # --------------------------------------------------------------------------
 
@@ -549,4 +907,9 @@ def stats():
 
 
 if __name__ == "__main__":
+    # Load the embedding model at startup so the first search isn't a cold
+    # start. It's best-effort: if it fails the app still serves everything
+    # else and search degrades to keyword matching.
+    embeddings.warm_model()
+
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=False)

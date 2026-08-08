@@ -71,10 +71,11 @@ $$(".nav-item[data-view]").forEach((btn) => {
     $$(".nav-item").forEach((b) => b.classList.remove("active"));
     btn.classList.add("active");
     const view = btn.dataset.view;
-    ["household", "catalog", "pipeline"].forEach((v) =>
+    ["household", "catalog", "pipeline", "recipes"].forEach((v) =>
       $(`#view-${v}`).classList.toggle("hidden", v !== view));
     if (view === "catalog") loadCatalog();
     if (view === "pipeline") loadPipeline();
+    if (view === "recipes") loadRecipes();
   });
 });
 
@@ -626,6 +627,344 @@ async function loadPipeline() {
         : `<div class="muted">No ingredients loaded yet.</div>`}
     </div>`;
 }
+
+/* --------------------------------------------------------------- recipes */
+
+let recipeRows = [];
+
+// A video description can prove a recipe contains pork, but never that its
+// meat was slaughtered halal - so a clean recipe reads "halal unverified", not
+// "halal ok". Saying nothing at all would let absence read as approval.
+const halalRecipeBadge = (r) => {
+  if (r.halal_status === "contains_flagged" || r.contains_pork)
+    return '<span class="badge strict">not halal</span>';
+  if (r.halal_status === "certified" || r.halal_status === "likely_ok")
+    return '<span class="badge ok">halal ok</span>';
+  return `<span class="badge" title="No pork or alcohol found in the ingredient
+list, but nothing confirms how the meat was sourced. Check before cooking."
+          >halal unverified</span>`;
+};
+
+const dietBadges = (r) => `
+  ${r.is_vegan ? '<span class="badge ok">vegan</span>'
+    : r.is_vegetarian ? '<span class="badge ok">veg</span>' : ""}
+  ${r.contains_pork ? '<span class="badge strict">pork</span>' : ""}
+  ${r.contains_gluten ? '<span class="badge warn">gluten</span>' : ""}
+  ${r.contains_lactose ? '<span class="badge warn">lactose</span>' : ""}
+  ${halalRecipeBadge(r)}`;
+
+// LLM extraction is imperfect and the UI says so rather than hiding it, so a
+// low-confidence parse gets reviewed instead of silently planned around.
+const confidenceBadge = (r) => {
+  const c = r.extraction_confidence;
+  if (c === null || c === undefined) return "";
+  const tone = c >= 0.8 ? "ok" : c >= 0.5 ? "warn" : "strict";
+  return `<span class="badge ${tone}" title="LLM extraction confidence">
+            parse ${Math.round(c * 100)}%</span>`;
+};
+
+async function loadRecipes() {
+  const q = $("#recipe-search").value.trim();
+  const body = $("#recipes-body");
+  const mode = $("#recipe-mode");
+  body.innerHTML = `<div class="empty"><div class="empty-sub">Searching…</div></div>`;
+  mode.textContent = "";
+
+  const params = new URLSearchParams({ limit: "24" });
+  if ($("#rf-household").checked) params.set("household_id", HOUSEHOLD_ID);
+  if ($("#rf-approved").checked) params.set("approved_only", "true");
+
+  let data;
+  try {
+    if (q) {
+      params.set("q", q);
+      data = await api(`/api/recipes/search?${params}`);
+    } else {
+      // No query means browse, which needs no embeddings at all.
+      data = await api(`/api/recipes?${params}`);
+      data.mode = "browse";
+    }
+  } catch (err) {
+    body.innerHTML = `<div class="empty">
+        <div class="empty-icon">⚠️</div>
+        <div class="empty-title">Search failed</div>
+        <div class="empty-sub">${esc(err.message)}</div>
+      </div>`;
+    return;
+  }
+
+  recipeRows = data.results || [];
+
+  if (data.mode === "semantic") mode.textContent = `semantic · ${data.model || ""}`;
+  else if (data.mode === "keyword-fallback") mode.textContent = "keyword fallback";
+  else if (data.mode === "browse") mode.textContent = "browsing all recipes";
+
+  const notes = [];
+  if (data.warning) notes.push(`<div class="note warn"><span>⚠️</span><div>${esc(data.warning)}</div></div>`);
+  if (data.message) notes.push(`<div class="note info"><span>ℹ️</span><div>${esc(data.message)}</div></div>`);
+  // Be explicit about restrictions we can't enforce in SQL, so an empty
+  // warning isn't read as "this list is safe".
+  if (data.unenforced_restrictions?.length) {
+    notes.push(`<div class="note info"><span>ℹ️</span><div>
+      Filtered on what the recipe data supports. Not enforced here:
+      <strong>${data.unenforced_restrictions.map((r) =>
+        esc(RESTRICTION_LABELS[r] || r)).join(", ")}</strong> — check the
+      ingredients before cooking.</div></div>`);
+  }
+
+  if (!recipeRows.length) {
+    body.innerHTML = notes.join("") + `
+      <div class="empty">
+        <div class="empty-icon">📺</div>
+        <div class="empty-title">${q ? "No matches" : "No recipes yet"}</div>
+        <div class="empty-sub">${q
+          ? "Try describing the meal differently, or clear the filters."
+          : "Run <span class='mono'>notebooks/harvest_youtube_recipes.py</span> then <span class='mono'>notebooks/embed_content.py</span>."}</div>
+      </div>`;
+    return;
+  }
+
+  body.innerHTML = notes.join("") + `
+    <div class="recipe-grid">
+      ${recipeRows.map((r) => `
+        <article class="recipe-card" data-recipe="${r.recipe_id}">
+          <div class="recipe-thumb">
+            ${r.thumbnail_url
+              ? `<img src="${esc(r.thumbnail_url)}" alt="" loading="lazy">`
+              : `<div class="recipe-thumb-fallback">🍲</div>`}
+            ${r.duration_min ? `<span class="recipe-duration">${r.duration_min} min</span>` : ""}
+            ${r.similarity !== null && r.similarity !== undefined
+              ? `<span class="recipe-match" title="cosine similarity">${Math.round(r.similarity * 100)}% match</span>`
+              : ""}
+          </div>
+          <div class="recipe-body">
+            <div class="recipe-title">${esc(r.title)}</div>
+            <div class="faint recipe-meta">
+              ${esc(r.channel_title || "")}${r.cuisine ? ` · ${esc(r.cuisine)}` : ""}
+            </div>
+            <div class="badges">
+              ${dietBadges(r)}
+              ${confidenceBadge(r)}
+              ${r.review_status === "approved"
+                ? '<span class="badge ok">approved</span>'
+                : r.review_status === "rejected"
+                ? '<span class="badge strict">rejected</span>'
+                : '<span class="badge">needs review</span>'}
+            </div>
+          </div>
+        </article>`).join("")}
+    </div>
+    <p class="faint" style="font-size:12px;margin-top:12px">
+      Showing ${recipeRows.length} recipes. Ingredient lists come from an LLM reading
+      the video description — check them before shopping.
+    </p>`;
+}
+
+$("#btn-recipe-search").addEventListener("click", loadRecipes);
+$("#recipe-search").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") loadRecipes();
+});
+$("#rf-household").addEventListener("change", loadRecipes);
+$("#rf-approved").addEventListener("change", loadRecipes);
+
+/* -------------------------------------------------- recipe detail dialog */
+
+let openRecipeId = null;
+let openRecipeServings = null;
+// Taken from the detail payload, not the search results - the search SELECT
+// doesn't carry video_id, so deep-links would silently lose their timestamps.
+let openRecipeVideoId = null;
+
+$("#recipes-body").addEventListener("click", (e) => {
+  const card = e.target.closest("[data-recipe]");
+  if (card) openRecipe(Number(card.dataset.recipe));
+});
+
+async function openRecipe(recipeId, servings = null) {
+  openRecipeId = recipeId;
+  const dlg = $("#recipe-dialog");
+  const body = $("#recipe-dialog-body");
+
+  if (!dlg.open) {
+    body.innerHTML = `<div class="empty"><div class="empty-sub">Loading…</div></div>`;
+    dlg.showModal();
+  }
+
+  // Default to cooking for everyone in the household rather than whatever the
+  // video assumed - that's the number the family actually needs.
+  const wanted = servings ?? openRecipeServings ?? (members.length || null);
+  const url = `/api/recipes/${recipeId}` + (wanted ? `?servings=${wanted}` : "");
+
+  let data;
+  try {
+    data = await api(url);
+  } catch (err) {
+    body.innerHTML = `<div class="note warn"><span>⚠️</span><div>${esc(err.message)}</div></div>`;
+    return;
+  }
+
+  const r = data.recipe;
+  openRecipeServings = data.servings;
+  openRecipeVideoId = r.video_id || null;
+  $("#recipe-dialog-title").textContent = r.title;
+
+  const fmtQty = (row) => {
+    if (row.scaled_quantity === null || row.scaled_quantity === undefined) return "";
+    const q = row.scaled_quantity;
+    const shown = q >= 10 ? Math.round(q) : Math.round(q * 100) / 100;
+    return `${shown}${row.unit ? " " + esc(row.unit) : ""}`;
+  };
+
+  const scalingHint = (row) =>
+    row.scaling_class === "sublinear"
+      ? `<span class="badge" title="Spices, salt and oil don't scale linearly - tripling the chilli makes it inedible">^0.8</span>`
+      : row.scaling_class === "fixed"
+      ? `<span class="badge" title="Doesn't scale - one bay leaf is one bay leaf">fixed</span>`
+      : "";
+
+  const proteins = data.ingredients.filter((i) => i.is_protein_component);
+  const base = data.ingredients.filter((i) => !i.is_protein_component);
+
+  const ingredientTable = (rows, caption) => !rows.length ? "" : `
+    <div class="ingr-group">
+      <div class="ingr-caption">${caption}</div>
+      <table class="ingr-table">
+        <tbody>
+          ${rows.map((row) => `
+            <tr class="${row.is_optional ? "optional" : ""}">
+              <td class="ingr-qty">${fmtQty(row)}</td>
+              <td>
+                <div>${esc(row.canonical_name || row.raw_text)}</div>
+                ${row.canonical_name && row.raw_text !== row.canonical_name
+                  ? `<div class="faint" style="font-size:11.5px">“${esc(row.raw_text)}”</div>`
+                  : ""}
+              </td>
+              <td class="num">${scalingHint(row)}
+                ${row.is_optional ? '<span class="badge">optional</span>' : ""}
+                ${row.ingredient_id ? "" : '<span class="badge warn" title="No catalog match - not priced or diet-checked">unmatched</span>'}
+              </td>
+            </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>`;
+
+  const videoId = r.video_id || "";
+  body.innerHTML = `
+    ${videoId ? `
+      <div class="video-wrap">
+        <iframe id="recipe-video" src="https://www.youtube-nocookie.com/embed/${esc(videoId)}"
+                title="${esc(r.title)}" loading="lazy" allowfullscreen
+                referrerpolicy="strict-origin-when-cross-origin"></iframe>
+      </div>
+      <a class="faint" style="font-size:12px" target="_blank" rel="noopener"
+         href="${esc(r.video_url || `https://www.youtube.com/watch?v=${videoId}`)}">
+        Open on YouTube ↗</a>` : ""}
+
+    <div class="servings-bar">
+      <div>
+        <div class="label">Cooking for</div>
+        <div class="faint" style="font-size:12px">
+          Video serves ${num(data.base_servings, 0)} · scaled ×${num(data.scale_factor, 2)}
+        </div>
+      </div>
+      <div class="stepper">
+        <button class="btn btn-sm" data-servings="-1">−</button>
+        <span class="stepper-value">${num(data.servings, 0)}</span>
+        <button class="btn btn-sm" data-servings="1">+</button>
+      </div>
+    </div>
+
+    <div class="badges" style="margin:12px 0">${dietBadges(r)} ${confidenceBadge(r)}</div>
+
+    ${ingredientTable(base, "Base dish — cooked once, covers lunch and dinner")}
+    ${ingredientTable(proteins, "Protein add-ons — per member, cooked separately")}
+
+    ${data.ingredients.length ? "" :
+      `<div class="note warn"><span>⚠️</span><div>No ingredients were extracted
+        for this recipe. Reject it, or open the video and add them by hand.</div></div>`}
+
+    ${r.instructions ? `
+      <div class="ingr-group">
+        <div class="ingr-caption">Steps</div>
+        <div class="form-row" style="grid-template-columns:1fr auto;margin-bottom:8px">
+          <input type="text" id="step-search" placeholder="Ask a step — when do I add the coconut milk?">
+          <button class="btn btn-sm" id="btn-step-search">Find</button>
+        </div>
+        <div id="step-results"></div>
+        <div class="instructions">${esc(r.instructions)}</div>
+      </div>` : ""}`;
+
+  $("#recipe-approve").textContent =
+    r.review_status === "approved" ? "Approved ✓" : "Approve for planning";
+}
+
+$("#recipe-dialog-body").addEventListener("click", async (e) => {
+  const step = e.target.closest("[data-servings]");
+  if (step) {
+    const next = Math.max(1, (openRecipeServings || 4) + Number(step.dataset.servings));
+    await openRecipe(openRecipeId, next);
+    return;
+  }
+  if (e.target.closest("#btn-step-search")) runStepSearch();
+});
+
+$("#recipe-dialog-body").addEventListener("keydown", (e) => {
+  if (e.target.id === "step-search" && e.key === "Enter") {
+    e.preventDefault();
+    runStepSearch();
+  }
+});
+
+async function runStepSearch() {
+  const q = $("#step-search")?.value.trim();
+  const out = $("#step-results");
+  if (!q || !out) return;
+  out.innerHTML = `<div class="faint" style="font-size:12px">Searching steps…</div>`;
+
+  const data = await api(
+    `/api/recipes/${openRecipeId}/steps?q=${encodeURIComponent(q)}&limit=3`);
+
+  if (!data.results.length) {
+    out.innerHTML = `<div class="faint" style="font-size:12px">${
+      esc(data.message || "No matching step. The recipe may not be chunked yet.")
+    }</div>`;
+    return;
+  }
+
+  const videoId = openRecipeVideoId;
+
+  out.innerHTML = data.results.map((s) => `
+    <div class="step-hit">
+      <div class="step-text">${esc(s.chunk_text)}</div>
+      <div class="step-meta">
+        ${s.similarity ? `${Math.round(s.similarity * 100)}% match` : ""}
+        ${s.start_second !== null && s.start_second !== undefined && videoId
+          ? ` · <a href="https://www.youtube.com/watch?v=${esc(videoId)}&t=${s.start_second}s"
+                   target="_blank" rel="noopener">jump to ${
+                     Math.floor(s.start_second / 60)}:${
+                     String(s.start_second % 60).padStart(2, "0")} ↗</a>`
+          : ""}
+      </div>
+    </div>`).join("");
+}
+
+async function setReview(status) {
+  try {
+    await api(`/api/recipes/${openRecipeId}/review`, {
+      method: "PUT",
+      body: { review_status: status },
+    });
+    toast(status === "approved" ? "Recipe approved — it can be planned now"
+                                : "Recipe rejected", status === "approved" ? "ok" : "warn");
+    $("#recipe-dialog").close();
+    loadRecipes();
+  } catch (err) {
+    toast(err.message, "bad");
+  }
+}
+
+$("#recipe-approve").addEventListener("click", () => setReview("approved"));
+$("#recipe-reject").addEventListener("click", () => setReview("rejected"));
 
 /* ---------------------------------------------------------------- health */
 

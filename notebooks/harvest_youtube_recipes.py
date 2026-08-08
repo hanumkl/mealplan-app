@@ -306,13 +306,22 @@ UPSERT_RECIPE = """
 INSERT INTO recipes (
     title, cuisine, language, source, source_ref, video_id, video_url,
     channel_title, thumbnail_url, duration_min, base_servings,
-    description, instructions, extraction_confidence, review_status
-) VALUES (%s, %s, %s, 'youtube', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    description, instructions, extraction_confidence, review_status,
+    is_vegetarian, is_vegan, contains_pork, contains_gluten, contains_lactose,
+    halal_status
+) VALUES (%s, %s, %s, 'youtube', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+          %s, %s, %s, %s, %s, %s)
 ON CONFLICT (source, source_ref) DO UPDATE SET
     title                 = EXCLUDED.title,
     cuisine               = EXCLUDED.cuisine,
     instructions          = EXCLUDED.instructions,
-    extraction_confidence = EXCLUDED.extraction_confidence
+    extraction_confidence = EXCLUDED.extraction_confidence,
+    is_vegetarian         = EXCLUDED.is_vegetarian,
+    is_vegan              = EXCLUDED.is_vegan,
+    contains_pork         = EXCLUDED.contains_pork,
+    contains_gluten       = EXCLUDED.contains_gluten,
+    contains_lactose      = EXCLUDED.contains_lactose,
+    halal_status          = EXCLUDED.halal_status
 RETURNING recipe_id
 """
 
@@ -343,6 +352,96 @@ def safe_num(v):
         return None
 
 
+# ---------------------------------------------------------------------------
+# Diet + halal flags, derived from the extracted ingredient list.
+#
+# These columns are what the app filters a household's strict restrictions on.
+# Left NULL they are worse than useless: `contains_pork IS NOT TRUE` passes a
+# NULL, so a pork recipe would be shown to a halal household as if it were
+# fine. Deriving them here is what makes that filter mean something.
+#
+# Word-boundary matching, not substring - the catalogue pipeline learned this
+# the hard way when "rum" matched du-rum-wheat and flagged couscous as
+# alcoholic. Indonesian terms are included because the recipes are Indonesian.
+# ---------------------------------------------------------------------------
+
+PORK_TOKENS = ["pork", "bacon", "ham", "lard", "gammon", "prosciutto",
+               "pancetta", "chorizo", "salami", "pepperoni", "babi", "speck"]
+ALCOHOL_TOKENS = ["wine", "beer", "rum", "sake", "mirin", "vodka", "brandy",
+                  "sherry", "whisky", "whiskey", "arak", "shaoxing"]
+MEAT_TOKENS = ["chicken", "beef", "lamb", "mutton", "goat", "duck", "turkey",
+               "veal", "fish", "shrimp", "prawn", "squid", "anchovy", "tuna",
+               "salmon", "crab", "clam", "mussel", "oyster", "gelatin",
+               "gelatine", "ayam", "sapi", "kambing", "bebek", "ikan",
+               "udang", "cumi", "teri", "daging"] + PORK_TOKENS
+DAIRY_TOKENS = ["milk", "cheese", "butter", "cream", "yoghurt", "yogurt",
+                "ghee", "susu", "keju", "mentega", "krim"]
+# Plant foods whose names contain a dairy word. Without these, "coconut milk"
+# matches "milk" and almost every Indonesian recipe is wrongly marked as
+# containing lactose - which would hide all of them from the lactose-free
+# member. Same for the peanut butter in gado-gado and satay sauce.
+NON_DAIRY_PHRASES = ["coconut milk", "coconut cream", "santan", "almond milk",
+                     "soy milk", "soya milk", "oat milk", "rice milk",
+                     "cashew milk", "peanut butter", "almond butter",
+                     "nut butter", "cocoa butter", "shea butter",
+                     "coconut butter", "susu kelapa", "kelapa"]
+EGG_TOKENS = ["egg", "telur", "mayonnaise", "mayo"]
+# Wheat-specific. Plain "flour"/"noodle" is ambiguous - rice flour and rice
+# noodles are gluten-free - so those are only counted via explicit wheat words.
+GLUTEN_TOKENS = ["wheat", "flour", "bread", "pasta", "spaghetti", "macaroni",
+                 "barley", "rye", "semolina", "panko", "breadcrumb", "couscous",
+                 "soy sauce", "kecap", "terigu", "roti", "mie", "noodle",
+                 "seitan", "malt"]
+GLUTEN_FREE_QUALIFIERS = ["rice flour", "rice noodle", "glass noodle",
+                          "tepung beras", "bihun", "gluten-free", "gluten free",
+                          "tamari", "cornflour", "corn flour", "tapioca"]
+
+
+def _has_token(text: str, tokens) -> bool:
+    return any(re.search(rf"(?:^|[^a-z0-9]){re.escape(t)}(?:[^a-z0-9]|$)", text)
+               for t in tokens)
+
+
+def derive_flags(recipe: dict) -> dict:
+    """Return the diet/halal columns for one extracted recipe."""
+    blob = " ".join([
+        recipe.get("title") or "",
+        " ".join(str(i.get("name") or "") for i in recipe.get("ingredients", [])),
+        " ".join(str(i.get("raw_text") or "") for i in recipe.get("ingredients", [])),
+    ]).lower()
+
+    has_pork = _has_token(blob, PORK_TOKENS)
+    has_alcohol = _has_token(blob, ALCOHOL_TOKENS)
+    has_meat = _has_token(blob, MEAT_TOKENS)
+    has_egg = _has_token(blob, EGG_TOKENS)
+
+    # Strip plant-based "milk"/"butter" phrases before looking for dairy, so
+    # coconut milk and peanut butter don't read as lactose.
+    dairy_blob = blob
+    for phrase in NON_DAIRY_PHRASES:
+        dairy_blob = dairy_blob.replace(phrase, " ")
+    has_dairy = _has_token(dairy_blob, DAIRY_TOKENS)
+
+    gluten = _has_token(blob, GLUTEN_TOKENS)
+    if gluten and any(q in blob for q in GLUTEN_FREE_QUALIFIERS):
+        # An explicit gluten-free form of an otherwise-glutenous word appears,
+        # so we can't tell which one it is. Say so instead of guessing.
+        gluten = None
+
+    return {
+        "is_vegetarian": not has_meat,
+        "is_vegan": not (has_meat or has_dairy or has_egg),
+        "contains_pork": has_pork,
+        "contains_gluten": gluten,
+        "contains_lactose": has_dairy,
+        # Deliberately never 'certified' or 'likely_ok'. A YouTube description
+        # is not evidence that meat was slaughtered halal, so the best an
+        # unflagged recipe can earn here is 'unknown' - the household confirms
+        # it, exactly like the ingredient catalogue.
+        "halal_status": "contains_flagged" if (has_pork or has_alcohol) else "unknown",
+    }
+
+
 written_recipes = 0
 written_ingredients = 0
 
@@ -352,6 +451,7 @@ with psycopg2.connect(LAKEBASE_URL) as conn:
             v = r["_video"]
             confidence = safe_num(r.get("confidence")) or 0.0
             review = "approved" if confidence >= MIN_CONFIDENCE else "pending"
+            flags = derive_flags(r)
 
             cur.execute(UPSERT_RECIPE, (
                 (r.get("title") or v["title"])[:300],
@@ -368,6 +468,12 @@ with psycopg2.connect(LAKEBASE_URL) as conn:
                 r.get("instructions"),
                 confidence,
                 review,
+                flags["is_vegetarian"],
+                flags["is_vegan"],
+                flags["contains_pork"],
+                flags["contains_gluten"],
+                flags["contains_lactose"],
+                flags["halal_status"],
             ))
             recipe_id = cur.fetchone()[0]
             written_recipes += 1

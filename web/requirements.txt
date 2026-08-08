@@ -4,3 +4,11 @@ sqlalchemy>=2.0.30
 flask>=3.0.3
 requests>=2.32.3
 python-dotenv>=1.0.1
+
+# Stage 2: the app embeds the user's query at request time so it lands in the
+# same vector space as the content embedded by notebooks/embed_content.py.
+# torch is the heavy part (~800MB); the app degrades to keyword search rather
+# than failing if it can't be loaded.
+sentence-transformers>=3.0.0
+torch>=2.2.0
+numpy>=1.26.0
