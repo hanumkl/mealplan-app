@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv/
+
+# Receipt images are personal data - never commit them
+data/receipts/*
+!data/receipts/.gitkeep

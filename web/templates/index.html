@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ruokasuunnitelma — family meal planner</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍲</text></svg>">
+</head>
+<body>
+<div class="layout">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">🍲</div>
+      <div>
+        <div class="brand-name">Ruokasuunnitelma</div>
+        <div class="brand-sub">Family meal planner</div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <div class="nav-label">Stage 1</div>
+      <button class="nav-item active" data-view="household">
+        <span class="ico">👨‍👩‍👧</span> Household
+      </button>
+      <button class="nav-item" data-view="catalog">
+        <span class="ico">🛒</span> Catalog
+      </button>
+      <button class="nav-item" data-view="pipeline">
+        <span class="ico">📊</span> Pipeline
+      </button>
+
+      <div class="nav-label" style="margin-top:16px">Coming next</div>
+      <button class="nav-item disabled" disabled>
+        <span class="ico">🔍</span> Recipes <span class="stage-tag">S2</span>
+      </button>
+      <button class="nav-item disabled" disabled>
+        <span class="ico">📅</span> Week plan <span class="stage-tag">S3</span>
+      </button>
+      <button class="nav-item disabled" disabled>
+        <span class="ico">🔥</span> Cook mode <span class="stage-tag">S3</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="health">
+        <span class="pulse" id="health-dot"></span>
+        <span id="health-text">checking…</span>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+
+    <!-- ============================ HOUSEHOLD ============================ -->
+    <section id="view-household">
+      <div class="page-head">
+        <h1 class="page-title">Household</h1>
+        <p class="page-sub">
+          Who you're cooking for, what each person is aiming at, and what they can't eat.
+          Everything the planner does downstream is constrained by this page.
+        </p>
+      </div>
+
+      <div id="constraint-summary"></div>
+
+      <div class="section-head">
+        <h2 class="section-title">Members</h2>
+        <button class="btn btn-primary btn-sm" id="btn-add-member">+ Add member</button>
+      </div>
+
+      <div class="grid grid-2" id="members-grid"></div>
+    </section>
+
+    <!-- ============================= CATALOG ============================= -->
+    <section id="view-catalog" class="hidden">
+      <div class="page-head">
+        <h1 class="page-title">Ingredient catalog</h1>
+        <p class="page-sub">
+          Ingredients from Open Food Facts, prices from your receipts, Lidl and manual
+          survey. Every price carries its source and capture date — nothing here claims
+          to be a live feed.
+        </p>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div class="form-row" style="grid-template-columns: 1fr auto">
+          <input type="text" id="ingredient-search"
+                 placeholder="Search ingredients — chicken, riisi, tempe…">
+          <button class="btn" id="btn-search">Search</button>
+        </div>
+      </div>
+
+      <div id="catalog-body"></div>
+    </section>
+
+    <!-- ============================ PIPELINE ============================= -->
+    <section id="view-pipeline" class="hidden">
+      <div class="page-head">
+        <h1 class="page-title">Pipeline status</h1>
+        <p class="page-sub">
+          What the Spark jobs have actually landed in Lakebase. If a number here is
+          zero, that notebook hasn't run yet.
+        </p>
+      </div>
+      <div id="pipeline-body"></div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ============================== DIALOGS ============================== -->
+<dialog id="member-dialog">
+  <form method="dialog" id="member-form">
+    <div class="dialog-head" id="member-dialog-title">Add member</div>
+    <div class="dialog-body">
+      <div class="field">
+        <label class="label" for="m-name">Name</label>
+        <input type="text" id="m-name" required>
+      </div>
+      <div class="form-row">
+        <div class="field">
+          <label class="label" for="m-role">Role</label>
+          <select id="m-role">
+            <option value="adult">Adult</option>
+            <option value="teen">Teen</option>
+            <option value="child">Child</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="label" for="m-sex">Sex</label>
+          <select id="m-sex">
+            <option value="male">Male</option>
+            <option value="female">Female</option>
+            <option value="unspecified">Unspecified</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="label" for="m-birth">Birth year</label>
+          <input type="number" id="m-birth" min="1920" max="2026" placeholder="1990">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="field">
+          <label class="label" for="m-weight">Weight (kg)</label>
+          <input type="number" id="m-weight" step="0.1" placeholder="72">
+        </div>
+        <div class="field">
+          <label class="label" for="m-height">Height (cm)</label>
+          <input type="number" id="m-height" step="0.1" placeholder="174">
+        </div>
+        <div class="field">
+          <label class="label" for="m-activity">Activity</label>
+          <select id="m-activity">
+            <option value="sedentary">Sedentary</option>
+            <option value="light">Light</option>
+            <option value="moderate" selected>Moderate</option>
+            <option value="active">Active</option>
+            <option value="very_active">Very active</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="dialog-foot">
+      <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+      <button type="submit" class="btn btn-primary">Save member</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="goal-dialog">
+  <form method="dialog" id="goal-form">
+    <div class="dialog-head">Daily targets — <span id="goal-member-name"></span></div>
+    <div class="dialog-body">
+      <div class="field">
+        <label class="label" for="g-type">Goal</label>
+        <select id="g-type">
+          <option value="maintain">Maintain</option>
+          <option value="bulking">Bulking</option>
+          <option value="cutting">Cutting</option>
+          <option value="growth">Growth (child)</option>
+        </select>
+      </div>
+      <button type="button" class="btn btn-sm" id="btn-calc" style="align-self:flex-start">
+        ⚡ Calculate from body stats
+      </button>
+      <div id="calc-note"></div>
+      <div class="form-row">
+        <div class="field">
+          <label class="label" for="g-kcal">kcal</label>
+          <input type="number" id="g-kcal">
+        </div>
+        <div class="field">
+          <label class="label" for="g-protein">Protein (g)</label>
+          <input type="number" id="g-protein">
+        </div>
+        <div class="field">
+          <label class="label" for="g-carb">Carbs (g)</label>
+          <input type="number" id="g-carb">
+        </div>
+        <div class="field">
+          <label class="label" for="g-fat">Fat (g)</label>
+          <input type="number" id="g-fat">
+        </div>
+      </div>
+    </div>
+    <div class="dialog-foot">
+      <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+      <button type="submit" class="btn btn-primary">Save targets</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="restriction-dialog">
+  <form method="dialog" id="restriction-form">
+    <div class="dialog-head">Add restriction — <span id="restriction-member-name"></span></div>
+    <div class="dialog-body">
+      <div class="field">
+        <label class="label" for="r-type">Restriction</label>
+        <select id="r-type">
+          <option value="halal">Halal</option>
+          <option value="vegetarian">Vegetarian</option>
+          <option value="vegan">Vegan</option>
+          <option value="no_pork">No pork</option>
+          <option value="no_alcohol">No alcohol</option>
+          <option value="lactose_free">Lactose free</option>
+          <option value="gluten_free">Gluten free</option>
+          <option value="nut_allergy">Nut allergy</option>
+          <option value="shellfish_allergy">Shellfish allergy</option>
+          <option value="egg_allergy">Egg allergy</option>
+          <option value="low_spice">Low spice</option>
+        </select>
+      </div>
+      <div class="field">
+        <label class="label" for="r-severity">Severity</label>
+        <select id="r-severity">
+          <option value="strict">Strict — must never be violated</option>
+          <option value="preference">Preference — can be traded off</option>
+        </select>
+      </div>
+      <div class="field">
+        <label class="label" for="r-note">Note (optional)</label>
+        <input type="text" id="r-note" placeholder="e.g. mild reaction, small amounts fine">
+      </div>
+      <div class="note">
+        ⚠️ Halal and allergy flags are derived from product labels and ingredient text.
+        Treat them as a filter, not a guarantee — always check the packaging.
+      </div>
+    </div>
+    <div class="dialog-foot">
+      <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+      <button type="submit" class="btn btn-primary">Add</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toast-host" id="toasts"></div>
+
+<script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
