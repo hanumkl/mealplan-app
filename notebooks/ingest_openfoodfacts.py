@@ -381,6 +381,15 @@ product_name = F.trim(F.coalesce(
     col_or_null("product_name_en"),
 ))
 
+# OFF categories run general -> specific, so the last element is the most
+# precise one ("en:plant-based-foods" ... "en:basmati-rice").
+#
+# The size() guard is load-bearing: serverless runs with ANSI mode on, where
+# element_at() on an empty array raises INVALID_ARRAY_INDEX instead of
+# returning NULL. Plenty of products have no categories at all.
+categories = F.coalesce(arr_or_empty("categories_tags"), F.array())
+category = F.when(F.size(categories) > 0, F.element_at(categories, -1))
+
 # COMMAND ----------
 
 curated = (
@@ -392,7 +401,7 @@ curated = (
         F.col("code").cast("string").alias("off_code"),
         F.col("canonical_name"),
         F.trim(col_or_null("product_name_fi")).alias("name_fi"),
-        F.element_at(F.coalesce(arr_or_empty("categories_tags"), F.array()), -1).alias("category"),
+        category.alias("category"),
         store_name.alias("store_name"),
 
         nutriment("energy-kcal_100g").alias("kcal_per_100g"),
