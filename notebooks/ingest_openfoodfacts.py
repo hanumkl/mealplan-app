@@ -429,7 +429,6 @@ curated = (
     .dropDuplicates(["off_code"])
 )
 
-curated.cache()
 print(f"curated: {curated.count()} products")
 display(curated.groupBy("halal_status").count().orderBy(F.desc("count")))
 
