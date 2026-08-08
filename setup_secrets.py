@@ -48,8 +48,18 @@ def grant_read(scope: str) -> None:
 ensure_scope("mealplan")
 lakebase_url = getpass.getpass("Paste your Lakebase connection URL: ").strip()
 if lakebase_url:
+    # getpass hides the input, so a mispaste looks exactly like a good one and
+    # only surfaces later as `invalid dsn` from psycopg2 - by which point it
+    # looks like a connection problem rather than a typo. Check the shape here.
+    if not lakebase_url.startswith("postgresql://"):
+        raise SystemExit(
+            f"That doesn't look like a Postgres URL - it starts with "
+            f"{lakebase_url[:14]!r}. Expected:\n"
+            f"  postgresql://<role>:<password>@<host>:5432/databricks_postgres?sslmode=require\n"
+            f"Nothing was stored."
+        )
     w.secrets.put_secret(scope="mealplan", key="lakebase-url", string_value=lakebase_url)
-    print("stored mealplan/lakebase-url")
+    print(f"stored mealplan/lakebase-url ({len(lakebase_url)} chars)")
 
 
 # --- YouTube Data API v3 (needed from Stage 2 onward) ----------------------
