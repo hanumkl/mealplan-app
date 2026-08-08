@@ -16,9 +16,9 @@ SELECT setval('households_household_id_seq',
 INSERT INTO members (household_id, name, role, birth_year, sex,
                      weight_kg, height_cm, activity_level)
 SELECT * FROM (VALUES
-    (1, 'Husband', 'adult', 1992, 'male',   72.0, 174.0, 'active'),
-    (1, 'Wife',    'adult', 1994, 'female', 58.0, 162.0, 'moderate'),
-    (1, 'Child',   'child', 2020, 'male',   18.0, 105.0, 'active')
+    (1, 'Husband', 'adult', 1993, 'male', 65.0, 173.0, 'active'),
+    (1, 'Wife',    'adult', 1996, 'female', 58.0, 158.0, 'light'),
+    (1, 'Child',   'child', 2021, 'female',   23.0, 105.0, 'active')
 ) AS v(household_id, name, role, birth_year, sex, weight_kg, height_cm, activity_level)
 WHERE NOT EXISTS (SELECT 1 FROM members WHERE household_id = 1);
 
@@ -47,6 +47,7 @@ INSERT INTO member_goals (member_id, goal_type, target_source)
 SELECT m.member_id,
        CASE WHEN m.role = 'child' THEN 'growth'
             WHEN m.name = 'Husband' THEN 'bulking'
+            WHEN m.name = 'Wife' THEN 'cutting' 
             ELSE 'maintain' END,
        'manual'
 FROM members m

@@ -45,13 +45,32 @@ def bad_request(message: str):
 # health + page
 # --------------------------------------------------------------------------
 
-@app.get("/healthz")
-def healthz():
+def _health_payload():
     try:
         run_one("SELECT 1 AS ok")
-        return jsonify({"status": "ok", "database": "connected"})
+        return {"status": "ok", "database": "connected"}, 200
     except Exception as exc:
-        return jsonify({"status": "degraded", "database": str(exc)}), 503
+        return {"status": "degraded", "database": str(exc)}, 503
+
+
+@app.get("/healthz")
+def healthz():
+    """Platform-facing probe. The Databricks Apps proxy may serve this path
+    itself, so the frontend uses /api/health instead."""
+    payload, code = _health_payload()
+    return jsonify(payload), code
+
+
+@app.get("/api/health")
+def api_health():
+    """Same check, on a path the proxy won't intercept.
+
+    Always returns 200 so the frontend can tell 'database is down' apart from
+    'the app itself is unreachable' - a 503 here would look identical to a
+    network failure in the browser.
+    """
+    payload, _ = _health_payload()
+    return jsonify(payload)
 
 
 @app.get("/")

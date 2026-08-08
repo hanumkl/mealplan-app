@@ -21,7 +21,20 @@ async function api(path, options = {}) {
   });
   if (res.status === 204) return null;
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+
+  // A proxy or error page can return HTML/plain text where we expect JSON.
+  // Parsing blindly would throw an opaque SyntaxError, so surface what
+  // actually came back instead.
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      throw new Error(`Expected JSON from ${path}, got: ${text.slice(0, 80)}`);
+    }
+  }
+
   if (!res.ok) throw new Error(data?.error || `${res.status} ${res.statusText}`);
   return data;
 }
@@ -528,13 +541,15 @@ async function loadPipeline() {
 
 async function checkHealth() {
   try {
-    const h = await api("/healthz");
+    const h = await api("/api/health");
     const ok = h.status === "ok";
     $("#health-dot").className = `pulse ${ok ? "ok" : "bad"}`;
     $("#health-text").textContent = ok ? "Lakebase connected" : "database degraded";
-  } catch {
+    if (!ok) $("#health-text").title = h.database || "";
+  } catch (err) {
     $("#health-dot").className = "pulse bad";
     $("#health-text").textContent = "app unreachable";
+    $("#health-text").title = err.message;
   }
 }
 
