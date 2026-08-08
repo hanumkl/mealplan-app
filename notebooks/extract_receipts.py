@@ -15,19 +15,20 @@
 # MAGIC rather than text, which is a stronger answer than embedding tidy API strings.
 # MAGIC
 # MAGIC ### Before running
-# MAGIC 1. Create a Volume, e.g. `main.mealplan.receipts`
-# MAGIC 2. Upload 10-15 receipt photos (JPG/PNG/HEIC-converted) into it
-# MAGIC 3. Set `vision_endpoint` below to a vision-capable serving endpoint in your
-# MAGIC    workspace (**Serving** in the sidebar lists what you have)
+# MAGIC 1. Create a Volume, e.g. `workspace.default.receipts`
+# MAGIC 2. Upload receipts into it — **JPG, PNG and PDF all work**
+# MAGIC    (Catalog → the volume → *Upload to this volume*)
+# MAGIC 3. Set `vision_endpoint` to a model in your workspace. The next cell
+# MAGIC    prints the ones you actually have, so you don't have to guess.
 
 # COMMAND ----------
 
-# MAGIC %pip install openai pillow
+# MAGIC %pip install openai pillow pymupdf
 # MAGIC %restart_python
 
 # COMMAND ----------
 
-dbutils.widgets.text("volume_path", "/Volumes/main/mealplan/receipts", "Receipt image volume")
+dbutils.widgets.text("volume_path", "/Volumes/workspace/default/receipts", "Receipt volume (jpg/png/pdf)")
 dbutils.widgets.text("vision_endpoint", "databricks-claude-sonnet-4-5", "Vision serving endpoint")
 dbutils.widgets.text("default_store", "Prisma", "Store when the receipt doesn't say")
 dbutils.widgets.text("lakebase_scope", "database", "Secret scope")
@@ -46,6 +47,34 @@ LAKEBASE_URL = dbutils.secrets.get(
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ### Which model can read a receipt?
+# MAGIC
+# MAGIC A "serving endpoint" is just a model your workspace can call over HTTP.
+# MAGIC This one has to be **vision-capable** (able to accept an image), unless
+# MAGIC every receipt you upload is a text-layer PDF.
+# MAGIC
+# MAGIC Run the cell below and copy a name into the `vision_endpoint` widget.
+
+# COMMAND ----------
+
+from databricks.sdk import WorkspaceClient
+
+# Names that indicate a model can accept images. Text-only models will error
+# on an image payload, so it's worth checking before a long run.
+VISION_HINTS = ("claude", "gpt-4", "gpt-5", "gemini", "llama-4", "pixtral", "vision")
+
+print(f"{'endpoint':52s} likely vision?")
+print("-" * 70)
+for ep in WorkspaceClient().serving_endpoints.list():
+    name = ep.name or ""
+    likely = "yes" if any(h in name.lower() for h in VISION_HINTS) else "-"
+    print(f"  {name:50s} {likely}")
+
+print(f"\ncurrently configured: {VISION_ENDPOINT}")
+
+# COMMAND ----------
+
 import base64
 import json
 import re
@@ -58,19 +87,42 @@ from pyspark.sql.window import Window
 
 # COMMAND ----------
 
-# MAGIC %md ## 1. Find receipt images
+# MAGIC %md
+# MAGIC ## 1. Find receipt files (images and PDFs)
+# MAGIC
+# MAGIC Digital receipts from S-mobiili and K-Ruoka download as PDFs, while
+# MAGIC photographed paper receipts are images. Both are handled:
+# MAGIC
+# MAGIC - **PDF with a text layer** (a real digital receipt) - the text is read
+# MAGIC   directly and sent to the model as text. More accurate and much cheaper
+# MAGIC   than looking at a picture of it, because nothing has to be recognised.
+# MAGIC - **PDF without text** (a scan) - each page is rendered to PNG and goes
+# MAGIC   down the vision path.
+# MAGIC - **JPG / PNG** - straight to the vision path.
 
 # COMMAND ----------
 
-images_sdf = (
+files_sdf = (
     spark.read.format("binaryFile")
-    .option("pathGlobFilter", "*.{jpg,jpeg,png,JPG,JPEG,PNG}")
+    .option("pathGlobFilter", "*.{jpg,jpeg,png,JPG,JPEG,PNG,pdf,PDF}")
     .load(VOLUME_PATH)
     .select("path", "length", "modificationTime", "content")
 )
 
-print(f"found {images_sdf.count()} receipt images in {VOLUME_PATH}")
-display(images_sdf.select("path", "length", "modificationTime"))
+total = files_sdf.count()
+if total == 0:
+    raise RuntimeError(
+        f"No receipts found in {VOLUME_PATH}. Upload .jpg/.png/.pdf files there "
+        f"first (Catalog > your volume > Upload to this volume)."
+    )
+
+print(f"found {total} receipt files in {VOLUME_PATH}")
+display(
+    files_sdf
+    .withColumn("kind", F.when(F.lower(F.col("path")).endswith(".pdf"), "pdf")
+                         .otherwise("image"))
+    .select("path", "kind", "length", "modificationTime")
+)
 
 # COMMAND ----------
 
@@ -80,8 +132,8 @@ with psycopg2.connect(LAKEBASE_URL) as conn:
         cur.execute("SELECT image_path FROM raw_receipts WHERE extraction_status = 'extracted'")
         done = {r[0] for r in cur.fetchall()}
 
-pending = images_sdf.collect() if REPROCESS else [
-    r for r in images_sdf.collect() if r["path"] not in done
+pending = files_sdf.collect() if REPROCESS else [
+    r for r in files_sdf.collect() if r["path"] not in done
 ]
 print(f"{len(pending)} receipts to process ({len(done)} already extracted)")
 
@@ -126,29 +178,72 @@ Rules:
 """
 
 
-def extract_receipt(image_bytes: bytes) -> dict:
-    """Send one receipt image to the vision endpoint and parse the JSON reply."""
+def pdf_text_and_images(pdf_bytes: bytes) -> tuple[str, list[bytes]]:
+    """Return (embedded text, page PNGs) for a PDF.
+
+    PyMuPDF is used rather than pdf2image because it needs no system packages -
+    poppler isn't installed on serverless compute.
+    """
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = "\n".join(page.get_text() for page in doc)
+    images = []
+    if len(text.strip()) < 120:                # no usable text layer -> scan
+        for page in doc:
+            # 2x zoom: receipts print small and the default 72dpi loses digits
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            images.append(pix.tobytes("png"))
+    doc.close()
+    return text, images
+
+
+def _call_model(content) -> dict:
     from databricks.sdk import WorkspaceClient
 
     client = WorkspaceClient().serving_endpoints.get_open_ai_client()
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-
     response = client.chat.completions.create(
         model=VISION_ENDPOINT,
         max_tokens=4096,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": EXTRACTION_PROMPT},
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-            ],
-        }],
+        messages=[{"role": "user", "content": content}],
     )
     text = response.choices[0].message.content.strip()
     # Models sometimes wrap JSON in a fence despite instructions.
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
     return json.loads(text)
+
+
+def extract_from_images(images: list[bytes]) -> dict:
+    """Vision path - one call carrying every page of the receipt."""
+    content = [{"type": "text", "text": EXTRACTION_PROMPT}]
+    for img in images:
+        b64 = base64.b64encode(img).decode("utf-8")
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}"},
+        })
+    return _call_model(content)
+
+
+def extract_from_text(text: str) -> dict:
+    """Text path - for PDFs that already carry their text.
+
+    Cheaper and more reliable than the vision path: the characters are exact
+    rather than recognised, so prices and pack sizes can't be misread.
+    """
+    return _call_model(
+        f"{EXTRACTION_PROMPT}\n\nRECEIPT TEXT:\n{text[:12000]}"
+    )
+
+
+def extract_receipt(path: str, content: bytes) -> dict:
+    """Route a receipt to the text or vision path based on what it actually is."""
+    if path.lower().endswith(".pdf"):
+        text, page_images = pdf_text_and_images(content)
+        if page_images:
+            return extract_from_images(page_images) | {"_mode": "pdf-scan-vision"}
+        return extract_from_text(text) | {"_mode": "pdf-text"}
+    return extract_from_images([content]) | {"_mode": "image-vision"}
 
 # COMMAND ----------
 
@@ -156,11 +251,12 @@ results = []
 for row in pending:
     path = row["path"]
     try:
-        parsed = extract_receipt(row["content"])
+        parsed = extract_receipt(path, row["content"])
         parsed["_path"] = path
         parsed["_status"] = "extracted"
         n = len(parsed.get("items", []))
-        print(f"OK   {path.split('/')[-1]:40s} {n:3d} items  conf={parsed.get('confidence')}")
+        print(f"OK   {path.split('/')[-1]:36s} [{parsed.get('_mode','?'):16s}] "
+              f"{n:3d} items  conf={parsed.get('confidence')}")
     except Exception as exc:
         parsed = {"_path": path, "_status": "failed", "_error": str(exc), "items": []}
         print(f"FAIL {path.split('/')[-1]:40s} {exc}")
