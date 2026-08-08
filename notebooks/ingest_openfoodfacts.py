@@ -448,38 +448,46 @@ display(
 
 # COMMAND ----------
 
-# MAGIC %md ## 3. Load into Lakebase
+# MAGIC %md
+# MAGIC ## 3. Load into Lakebase
+# MAGIC
+# MAGIC Serverless compute only allows DML writes through a fixed connector
+# MAGIC allowlist (csv/json/parquet/delta/mysql/snowflake/redshift/...) - plain
+# MAGIC `postgresql` via generic JDBC isn't on it, so `curated.write.jdbc(...)`
+# MAGIC fails with `UNSUPPORTED_DATA_SOURCE_WRITE` no matter what table it targets.
+# MAGIC
+# MAGIC At ~10k rows there's no reason to fight that restriction: dedupe in Spark
+# MAGIC (still the real transformation work), collect to the driver, and upsert
+# MAGIC with `psycopg2` - a plain Postgres client, not a Spark data source, so the
+# MAGIC allowlist doesn't apply to it.
 
 # COMMAND ----------
 
-def lakebase_jdbc(url: str) -> tuple[str, dict]:
-    """Turn a postgresql:// URL into JDBC url + connection properties."""
-    from urllib.parse import urlparse
+from pyspark.sql.window import Window
 
-    p = urlparse(url)
-    jdbc = f"jdbc:postgresql://{p.hostname}:{p.port or 5432}{p.path}?sslmode=require"
-    return jdbc, {
-        "user": p.username,
-        "password": p.password,
-        "driver": "org.postgresql.Driver",
-    }
-
-
-JDBC_URL, JDBC_PROPS = lakebase_jdbc(LAKEBASE_URL)
-
-# Staging table, then an idempotent upsert. Writing straight into `ingredients`
-# would clobber manually corrected rows.
-(
-    curated.write
-    .mode("overwrite")
-    .option("truncate", "true")
-    .jdbc(JDBC_URL, "stg_off_ingredients", properties=JDBC_PROPS)
+# Two OFF products can share a display name (e.g. two "Milk" entries with
+# different barcodes). Keep one row per case-insensitive name, preferring
+# whichever has calorie data - same intent as the old
+# `DISTINCT ON (lower(canonical_name)) ORDER BY ... kcal_per_100g NULLS LAST`.
+dedupe_window = (
+    Window.partitionBy(F.lower(F.col("canonical_name")))
+    .orderBy(F.col("kcal_per_100g").isNull(), F.col("off_code"))
 )
-print("staged to stg_off_ingredients")
+
+deduped = (
+    curated
+    .withColumn("_rank", F.row_number().over(dedupe_window))
+    .filter(F.col("_rank") == 1)
+    .drop("_rank")
+)
+
+rows = [r.asDict() for r in deduped.collect()]
+print(f"{len(rows)} deduplicated rows ready to upsert")
 
 # COMMAND ----------
 
 import psycopg2
+from psycopg2.extras import execute_values
 
 UPSERT_SQL = """
 INSERT INTO ingredients (
@@ -489,17 +497,7 @@ INSERT INTO ingredients (
     contains_gluten, contains_lactose, contains_nuts,
     halal_status, halal_reason, is_protein_source, scaling_class,
     source, updated_at
-)
-SELECT DISTINCT ON (lower(canonical_name))
-       canonical_name, name_fi, category, off_code,
-       kcal_per_100g, protein_g_per_100g, carb_g_per_100g, fat_g_per_100g,
-       is_vegetarian, is_vegan, contains_pork, contains_alcohol,
-       contains_gluten, contains_lactose, contains_nuts,
-       halal_status, halal_reason, is_protein_source, scaling_class,
-       'openfoodfacts', now()
-FROM stg_off_ingredients
-WHERE canonical_name IS NOT NULL AND length(trim(canonical_name)) > 1
-ORDER BY lower(canonical_name), kcal_per_100g NULLS LAST
+) VALUES %s
 ON CONFLICT (canonical_name) DO UPDATE SET
     name_fi            = COALESCE(EXCLUDED.name_fi, ingredients.name_fi),
     category           = COALESCE(EXCLUDED.category, ingredients.category),
@@ -513,12 +511,29 @@ ON CONFLICT (canonical_name) DO UPDATE SET
     updated_at         = now();
 """
 
+# Named placeholders so we can hand execute_values the row dicts directly -
+# no need to reorder each row into a tuple by hand.
+VALUE_TEMPLATE = """(
+    %(canonical_name)s, %(name_fi)s, %(category)s, %(off_code)s,
+    %(kcal_per_100g)s, %(protein_g_per_100g)s, %(carb_g_per_100g)s, %(fat_g_per_100g)s,
+    %(is_vegetarian)s, %(is_vegan)s, %(contains_pork)s, %(contains_alcohol)s,
+    %(contains_gluten)s, %(contains_lactose)s, %(contains_nuts)s,
+    %(halal_status)s, %(halal_reason)s, %(is_protein_source)s, %(scaling_class)s,
+    'openfoodfacts', now()
+)"""
+
 with psycopg2.connect(LAKEBASE_URL) as conn:
     with conn.cursor() as cur:
-        cur.execute(UPSERT_SQL)
-        upserted = cur.rowcount
         cur.execute("SELECT COUNT(*) FROM ingredients")
-        total = cur.fetchone()[0]
+        before = cur.fetchone()[0]
+
+        # execute_values batches into multiple statements at this row count,
+        # so cur.rowcount after the call would only reflect the last batch -
+        # a before/after count is what's actually accurate here.
+        execute_values(cur, UPSERT_SQL, rows, template=VALUE_TEMPLATE, page_size=500)
+
+        cur.execute("SELECT COUNT(*) FROM ingredients")
+        after = cur.fetchone()[0]
         cur.execute("""
             SELECT halal_status, COUNT(*)
             FROM ingredients GROUP BY halal_status ORDER BY 2 DESC
@@ -526,7 +541,8 @@ with psycopg2.connect(LAKEBASE_URL) as conn:
         breakdown = cur.fetchall()
     conn.commit()
 
-print(f"upserted {upserted} rows -> ingredients now has {total}\n")
+print(f"submitted {len(rows)} rows -> ingredients went from {before} to {after} "
+      f"({after - before} new, {len(rows) - (after - before)} updated existing)\n")
 for status, n in breakdown:
     print(f"  {status:20s} {n}")
 
