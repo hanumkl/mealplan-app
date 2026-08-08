@@ -5,20 +5,42 @@
 # MAGIC Spark pipeline that lands Finnish grocery products and derives the dietary
 # MAGIC flags the meal planner constrains against.
 # MAGIC
-# MAGIC **Two source modes** (`source_mode` widget):
+# MAGIC ## Which API this uses, and why
 # MAGIC
-# MAGIC | mode | what it does | when to use |
+# MAGIC Open Food Facts has two search facilities, and **the older one is down**:
+# MAGIC
+# MAGIC | endpoint | status | notes |
 # MAGIC |---|---|---|
-# MAGIC | `api` | pages the free OFF search API filtered to Finland | first run, no setup |
+# MAGIC | `world.openfoodfacts.org/api/v2/search` | ❌ 503 | legacy, heavily overloaded |
+# MAGIC | `world.openfoodfacts.org/cgi/search.pl` | ❌ 503 | same backend |
+# MAGIC | **`search.openfoodfacts.org/search`** | ✅ | Search-a-licious, what we use |
+# MAGIC | `world.openfoodfacts.org/api/v2/product/<code>` | ✅ | single product lookups |
+# MAGIC
+# MAGIC Search-a-licious also accepts `page_size=1000`, so ~10,000 Finnish products
+# MAGIC arrive in about 10 requests instead of 100 — which sidesteps rate limiting
+# MAGIC almost entirely.
+# MAGIC
+# MAGIC **One important difference:** it returns `ingredients_tags` (structured, e.g.
+# MAGIC `en:wheat-flour`, `en:salt`) rather than free-text `ingredients_text`. That's
+# MAGIC better for our purposes — the allergen and halal scans run against canonical
+# MAGIC tags instead of guessing at spelling across three languages.
+# MAGIC
+# MAGIC ## Source modes
+# MAGIC
+# MAGIC | mode | what it does | when |
+# MAGIC |---|---|---|
+# MAGIC | `api` | pages Search-a-licious, filtered by country | first run, no setup |
 # MAGIC | `dump` | reads the full OFF Parquet dump from a UC Volume | real Spark scale |
 # MAGIC
-# MAGIC Start with `api`. Switch to `dump` once you've downloaded the dump — it's the
-# MAGIC same downstream code, just millions of rows instead of thousands.
+# MAGIC Both paths converge on the same transform. Dump mode additionally carries
+# MAGIC `ingredients_text`, which the flag derivation picks up automatically.
 # MAGIC
-# MAGIC **Halal flagging is deliberately four-valued**, never a bare boolean:
-# MAGIC `certified` (explicit label) / `contains_flagged` (pork, gelatine, alcohol,
-# MAGIC carmine found) / `likely_ok` (vegetarian or vegan label, nothing flagged) /
-# MAGIC `unknown`. The app shows the reason and tells the user to check packaging.
+# MAGIC ## Halal flagging
+# MAGIC
+# MAGIC Deliberately four-valued, never a bare boolean: `certified` (explicit label) /
+# MAGIC `contains_flagged` (pork, gelatine, alcohol or carmine found) / `likely_ok`
+# MAGIC (vegetarian or vegan label, nothing flagged) / `unknown`. The reason is stored
+# MAGIC alongside and shown in the UI.
 # MAGIC
 # MAGIC Requires: `LAKEBASE_URL` secret in scope `database`, and the SQL in `sql/` run.
 
@@ -30,15 +52,21 @@
 # COMMAND ----------
 
 dbutils.widgets.dropdown("source_mode", "api", ["api", "dump"])
-dbutils.widgets.text("countries", "finland", "OFF country tag(s), comma separated")
-dbutils.widgets.text("max_pages", "25", "api mode: pages to fetch (100 products each)")
+dbutils.widgets.text("countries", "en:finland", "Country tag(s), comma separated")
+dbutils.widgets.text("page_size", "1000", "api mode: products per request (max 1000)")
+dbutils.widgets.text("max_pages", "10", "api mode: pages per country")
+dbutils.widgets.text("request_interval_seconds", "2", "api mode: seconds between requests")
+dbutils.widgets.text("max_retries", "4", "api mode: retries per page on 429/5xx")
 dbutils.widgets.text("dump_path", "/Volumes/main/mealplan/off/food.parquet", "dump mode: Volume path")
 dbutils.widgets.text("lakebase_scope", "database", "Secret scope")
 dbutils.widgets.text("lakebase_key", "lakebase-url", "Secret key")
 
 SOURCE_MODE = dbutils.widgets.get("source_mode")
 COUNTRIES = [c.strip() for c in dbutils.widgets.get("countries").split(",") if c.strip()]
+PAGE_SIZE = int(dbutils.widgets.get("page_size"))
 MAX_PAGES = int(dbutils.widgets.get("max_pages"))
+REQUEST_INTERVAL = float(dbutils.widgets.get("request_interval_seconds"))
+MAX_RETRIES = int(dbutils.widgets.get("max_retries"))
 DUMP_PATH = dbutils.widgets.get("dump_path")
 
 LAKEBASE_URL = dbutils.secrets.get(
@@ -53,17 +81,9 @@ import time
 
 import requests
 from pyspark.sql import functions as F
-from pyspark.sql import types as T
 
+SEARCH_URL = "https://search.openfoodfacts.org/search"
 USER_AGENT = "mealplan-capstone/1.0 (databricks bootcamp project)"
-
-# Fields we need. Asking for a subset keeps the API responses small.
-OFF_FIELDS = [
-    "code", "product_name", "product_name_fi", "brands", "categories_tags",
-    "countries_tags", "stores", "stores_tags", "quantity",
-    "ingredients_text", "ingredients_text_fi", "allergens_tags", "traces_tags",
-    "labels_tags", "nutriments", "nova_group", "image_small_url",
-]
 
 # COMMAND ----------
 
@@ -71,96 +91,207 @@ OFF_FIELDS = [
 
 # COMMAND ----------
 
-def fetch_off_api(country: str, max_pages: int) -> list[dict]:
-    """Page the Open Food Facts search API for one country tag.
+def _get_page(country: str, page: int) -> list[dict] | None:
+    """Fetch one page of results, retrying on 429/5xx with exponential backoff.
 
-    Free, no API key. We sleep between pages - OFF asks clients to be gentle and
-    a capstone job has no reason to hammer a volunteer-run service.
+    Returns None when retries are exhausted, so the caller can keep the pages
+    that already succeeded rather than losing the whole run.
     """
-    products, url = [], "https://world.openfoodfacts.org/api/v2/search"
-    for page in range(1, max_pages + 1):
-        resp = requests.get(
-            url,
-            params={
-                "countries_tags": country,
-                "fields": ",".join(OFF_FIELDS),
-                "page_size": 100,
-                "page": page,
-            },
-            headers={"User-Agent": USER_AGENT},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        batch = resp.json().get("products", [])
-        if not batch:
+    delay = max(REQUEST_INTERVAL, 2.0)
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(
+                SEARCH_URL,
+                params={
+                    "q": f'countries_tags:"{country}"',
+                    "page_size": PAGE_SIZE,
+                    "page": page,
+                },
+                headers={"User-Agent": USER_AGENT},
+                timeout=120,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("hits", [])
+
+            if resp.status_code in (429, 500, 502, 503, 504):
+                wait = float(resp.headers.get("Retry-After", delay))
+                print(f"    HTTP {resp.status_code} page {page}, "
+                      f"retry {attempt}/{MAX_RETRIES} in {wait:.0f}s")
+                time.sleep(wait)
+                delay *= 2
+                continue
+
+            resp.raise_for_status()
+
+        except requests.RequestException as exc:
+            last_error = exc
+            print(f"    {type(exc).__name__} page {page}, "
+                  f"retry {attempt}/{MAX_RETRIES} in {delay:.0f}s")
+            time.sleep(delay)
+            delay *= 2
+
+    print(f"    giving up on page {page} ({last_error or 'repeated 5xx'})")
+    return None
+
+
+def fetch_country(country: str) -> list[dict]:
+    """Page Search-a-licious for one country tag."""
+    products = []
+    for page in range(1, MAX_PAGES + 1):
+        batch = _get_page(country, page)
+
+        if batch is None:
+            print(f"  stopped at page {page}, keeping {len(products)} products")
             break
+        if not batch:
+            print(f"  {country}: exhausted at page {page}")
+            break
+
         products.extend(batch)
         print(f"  {country} page {page}: +{len(batch)} (total {len(products)})")
-        time.sleep(1.0)
+
+        if len(batch) < PAGE_SIZE:
+            break
+        if page < MAX_PAGES:
+            time.sleep(REQUEST_INTERVAL)
+
     return products
 
+# COMMAND ----------
 
 if SOURCE_MODE == "api":
+    print(f"fetching up to {len(COUNTRIES) * MAX_PAGES * PAGE_SIZE} products "
+          f"from {SEARCH_URL}\n")
+
     raw = []
     for country in COUNTRIES:
-        raw.extend(fetch_off_api(country, MAX_PAGES))
+        raw.extend(fetch_country(country))
+
+    if not raw:
+        raise RuntimeError(
+            "Search-a-licious returned nothing. Check the country tag includes "
+            "its language prefix (en:finland, not finland), or switch "
+            "source_mode to 'dump'."
+        )
 
     # json round-trip so Spark infers a stable schema across ragged records
     raw_sdf = spark.read.json(spark.sparkContext.parallelize([json.dumps(r) for r in raw]))
-    print(f"fetched {raw_sdf.count()} products via API")
+    print(f"\nfetched {raw_sdf.count()} products")
 
 else:
-    # Full dump. Download once into a UC Volume, e.g.:
-    #   https://huggingface.co/datasets/openfoodfacts/product-database
-    #   (or the JSONL export at https://static.openfoodfacts.org/data/)
+    # Full dump. Download once into a UC Volume, e.g. from
+    # https://huggingface.co/datasets/openfoodfacts/product-database
     raw_sdf = (
         spark.read.parquet(DUMP_PATH)
         .filter(F.array_contains(F.col("countries_tags"), F.lit(COUNTRIES[0])))
     )
     print(f"read {raw_sdf.count()} products from dump")
 
-raw_sdf.createOrReplaceTempView("off_raw")
+AVAILABLE = set(raw_sdf.columns)
+print("columns:", sorted(AVAILABLE))
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## 2. Transform — derive dietary flags
 # MAGIC
-# MAGIC The interesting work: turning free-text ingredient lists and OFF's tag
-# MAGIC vocabulary into the boolean constraints the planner needs.
+# MAGIC The interesting work: turning OFF's tag vocabulary and (in dump mode) free
+# MAGIC ingredient text into the boolean constraints the planner needs.
 
 # COMMAND ----------
 
-# Substrings scanned in ingredients_text. Finnish, English and Indonesian, since
-# the recipe side of the project is trilingual.
+def col_or_null(name: str, dtype: str = "string"):
+    """Reference a column if the source has it, else a typed NULL.
+
+    The API and dump modes return overlapping but different fields, and this
+    keeps one transform working for both.
+    """
+    return F.col(name) if name in AVAILABLE else F.lit(None).cast(dtype)
+
+
+def arr_or_empty(name: str):
+    return F.col(name) if name in AVAILABLE else F.array().cast("array<string>")
+
+
+# nutriments is a nested struct whose field names contain hyphens, so it needs
+# backticks and a check on the *struct's* subfields rather than top-level names.
+NUTRIMENT_FIELDS = (
+    set(raw_sdf.schema["nutriments"].dataType.fieldNames())
+    if "nutriments" in AVAILABLE else set()
+)
+
+
+def nutriment(field: str):
+    """Reference nutriments.<field> if present, else a NULL double."""
+    if field in NUTRIMENT_FIELDS:
+        return F.col(f"nutriments.`{field}`").cast("double")
+    return F.lit(None).cast("double")
+
+
+print("nutriment fields available:", sorted(NUTRIMENT_FIELDS)[:12], "...")
+
+
+def text_blob(*names):
+    """Lowercased searchable text built from the given columns.
+
+    The two source modes disagree on shape: Search-a-licious returns `stores`
+    and `ingredients_tags` as ARRAY<STRING>, while the Parquet dump has
+    `stores` and `ingredients_text` as plain strings. Checking the actual
+    schema keeps one transform working for both.
+    """
+    parts = []
+    for name in names:
+        if name not in AVAILABLE:
+            continue
+        if raw_sdf.schema[name].dataType.typeName() == "array":
+            parts.append(F.coalesce(F.array_join(F.col(name), " "), F.lit("")))
+        else:
+            parts.append(F.coalesce(F.col(name).cast("string"), F.lit("")))
+    return F.lower(F.concat_ws(" ", *parts)) if parts else F.lit("")
+
+
+# One searchable blob per product: structured ingredient tags plus any free
+# text. Every token scan below runs against this.
+ingredients_blob = text_blob("ingredients_tags", "ingredients_text", "ingredients_text_fi")
+
+# COMMAND ----------
+
+# Tags are canonical English (en:pork), but dump-mode free text is often Finnish
+# or Indonesian, so we scan for all three.
 PORK_TOKENS = ["pork", "sianliha", "porsaan", "bacon", "pekoni", "ham", "kinkku",
                "lard", "babi", "prosciutto", "salami", "chorizo", "pancetta"]
 GELATIN_TOKENS = ["gelatin", "gelatine", "liivate", "gelatiini"]
 ALCOHOL_TOKENS = ["alcohol", "alkoholi", "wine", "viini", "beer", "olut", "rum",
-                  "brandy", "liqueur", "likööri", "mirin", "sake", "arak"]
+                  "brandy", "liqueur", "likoori", "mirin", "sake", "arak"]
 CARMINE_TOKENS = ["carmine", "cochineal", "e120", "karmiini"]
 
-GLUTEN_TOKENS = ["wheat", "vehnä", "barley", "ohra", "rye", "ruis", "gluten",
+GLUTEN_TOKENS = ["wheat", "vehna", "barley", "ohra", "rye", "ruis", "gluten",
                  "gluteeni", "malt", "mallas", "spelt", "terigu"]
 LACTOSE_TOKENS = ["milk", "maito", "lactose", "laktoosi", "cream", "kerma",
-                  "butter", "voi", "cheese", "juusto", "whey", "hera", "yoghurt",
-                  "jogurtti", "susu"]
-NUT_TOKENS = ["almond", "manteli", "hazelnut", "hasselpähkinä", "walnut",
-              "saksanpähkinä", "cashew", "kaju", "pistachio", "pistaasi",
-              "peanut", "maapähkinä", "pähkinä", "kacang"]
+                  "butter", "voi", "cheese", "juusto", "whey", "hera",
+                  "yoghurt", "jogurtti", "susu"]
+NUT_TOKENS = ["almond", "manteli", "hazelnut", "walnut", "cashew", "kaju",
+              "pistachio", "pistaasi", "peanut", "maapahkina", "pahkina", "kacang"]
 
 
-def any_token(col, tokens):
-    """True if the lowercased column contains any of the tokens."""
-    lowered = F.lower(F.coalesce(col, F.lit("")))
-    expr = F.lit(False)
-    for tok in tokens:
-        expr = expr | lowered.contains(tok)
-    return expr
+def has_token(blob, tokens):
+    """True if the blob contains any token as a whole word.
+
+    Substring matching is wrong here and dangerously so: plain `contains("rum")`
+    flags couscous as alcoholic because it's made from du-RUM wheat, and
+    `contains("ham")` flags anything with grafam/graham flour as pork. For a
+    halal filter those false positives matter, so we anchor on non-alphanumeric
+    boundaries - which also matches the hyphens and colons in tags like
+    `en:durum-wheat-semolina`.
+    """
+    pattern = r"(?:^|[^a-z0-9])(" + "|".join(tokens) + r")(?:[^a-z0-9]|$)"
+    return blob.rlike(pattern)
 
 
 def has_tag(col, *needles):
-    """True if any array element contains any needle (OFF tags are like 'en:halal')."""
+    """True if any array element contains any needle (tags look like 'en:halal')."""
     expr = F.lit(False)
     for needle in needles:
         expr = expr | F.exists(
@@ -171,107 +302,133 @@ def has_tag(col, *needles):
 
 # COMMAND ----------
 
-ingredients_col = F.coalesce(F.col("ingredients_text_fi"), F.col("ingredients_text"))
-labels = F.col("labels_tags")
+labels = arr_or_empty("labels_tags")
 allergens = F.array_union(
-    F.coalesce(F.col("allergens_tags"), F.array()),
-    F.coalesce(F.col("traces_tags"), F.array()),
+    F.coalesce(arr_or_empty("allergens_tags"), F.array()),
+    F.coalesce(arr_or_empty("traces_tags"), F.array()),
 )
 
-flagged = (
-    any_token(ingredients_col, PORK_TOKENS)
-    | any_token(ingredients_col, GELATIN_TOKENS)
-    | any_token(ingredients_col, ALCOHOL_TOKENS)
-    | any_token(ingredients_col, CARMINE_TOKENS)
-)
+# Negative labels are explicit "free from" claims and outrank a token match:
+# a product labelled en:no-gluten shouldn't be flagged because "wheat" appears
+# in a "may contain" note.
+label_no_gluten = has_tag(labels, "no-gluten", "gluten-free")
+label_no_lactose = has_tag(labels, "no-lactose", "lactose-free")
+label_vegan = has_tag(labels, "vegan")
+label_vegetarian = has_tag(labels, "vegetarian") | label_vegan
+label_halal = has_tag(labels, "halal")
 
-# Why a product got its halal status - surfaced verbatim in the UI.
+pork = has_token(ingredients_blob, PORK_TOKENS)
+gelatin = has_token(ingredients_blob, GELATIN_TOKENS)
+alcohol = has_token(ingredients_blob, ALCOHOL_TOKENS)
+carmine = has_token(ingredients_blob, CARMINE_TOKENS)
+flagged = pork | gelatin | alcohol | carmine
+
 halal_reason = (
-    F.when(has_tag(labels, "halal"), F.lit("explicit halal label"))
-     .when(any_token(ingredients_col, PORK_TOKENS), F.lit("pork-derived ingredient found"))
-     .when(any_token(ingredients_col, GELATIN_TOKENS),
-           F.lit("gelatine of unspecified source"))
-     .when(any_token(ingredients_col, ALCOHOL_TOKENS), F.lit("alcohol ingredient found"))
-     .when(any_token(ingredients_col, CARMINE_TOKENS), F.lit("carmine / E120 found"))
-     .when(has_tag(labels, "vegan"), F.lit("vegan label, nothing flagged"))
-     .when(has_tag(labels, "vegetarian"), F.lit("vegetarian label, nothing flagged"))
+    F.when(label_halal, F.lit("explicit halal label"))
+     .when(pork, F.lit("pork-derived ingredient found"))
+     .when(gelatin, F.lit("gelatine of unspecified source"))
+     .when(alcohol, F.lit("alcohol ingredient found"))
+     .when(carmine, F.lit("carmine / E120 found"))
+     .when(label_vegan, F.lit("vegan label, nothing flagged"))
+     .when(label_vegetarian, F.lit("vegetarian label, nothing flagged"))
      .otherwise(F.lit("no label and no flagged ingredient - unverified"))
 )
 
 halal_status = (
-    F.when(has_tag(labels, "halal"), F.lit("certified"))
+    F.when(label_halal, F.lit("certified"))
      .when(flagged, F.lit("contains_flagged"))
-     .when(has_tag(labels, "vegan") | has_tag(labels, "vegetarian"), F.lit("likely_ok"))
+     .when(label_vegetarian, F.lit("likely_ok"))
      .otherwise(F.lit("unknown"))
 )
 
 # Which Finnish chain stocks it, from OFF's crowd-sourced `stores` field.
+# Values are inconsistently cased, e.g. ["S-market", "prisma"].
+stores_lower = text_blob("stores", "stores_tags")
 store_name = (
-    F.when(F.lower(F.coalesce(F.col("stores"), F.lit(""))).contains("prisma"), F.lit("Prisma"))
-     .when(F.lower(F.coalesce(F.col("stores"), F.lit(""))).contains("lidl"), F.lit("Lidl"))
-     .when(F.lower(F.coalesce(F.col("stores"), F.lit(""))).contains("s-market"), F.lit("S-market"))
-     .when(F.lower(F.coalesce(F.col("stores"), F.lit(""))).contains("k-market"), F.lit("K-Market"))
+    F.when(stores_lower.contains("prisma"), F.lit("Prisma"))
+     .when(stores_lower.contains("lidl"), F.lit("Lidl"))
+     .when(stores_lower.contains("s-market"), F.lit("S-market"))
+     .when(stores_lower.contains("k-market"), F.lit("K-Market"))
      .otherwise(F.lit(None).cast("string"))
 )
+
+product_name = F.trim(F.coalesce(
+    col_or_null("product_name"),
+    col_or_null("product_name_fi"),
+    col_or_null("product_name_en"),
+))
+
+# COMMAND ----------
 
 curated = (
     raw_sdf
     .filter(F.col("code").isNotNull())
-    .filter(F.coalesce(F.col("product_name"), F.col("product_name_fi")).isNotNull())
+    .withColumn("canonical_name", product_name)
+    .filter(F.col("canonical_name").isNotNull() & (F.length("canonical_name") > 1))
     .select(
         F.col("code").cast("string").alias("off_code"),
-        F.trim(F.coalesce(F.col("product_name"), F.col("product_name_fi")))
-            .alias("canonical_name"),
-        F.trim(F.col("product_name_fi")).alias("name_fi"),
-        F.element_at(F.coalesce(F.col("categories_tags"), F.array()), -1).alias("category"),
+        F.col("canonical_name"),
+        F.trim(col_or_null("product_name_fi")).alias("name_fi"),
+        F.element_at(F.coalesce(arr_or_empty("categories_tags"), F.array()), -1).alias("category"),
         store_name.alias("store_name"),
 
-        F.col("nutriments.energy-kcal_100g").cast("double").alias("kcal_per_100g"),
-        F.col("nutriments.proteins_100g").cast("double").alias("protein_g_per_100g"),
-        F.col("nutriments.carbohydrates_100g").cast("double").alias("carb_g_per_100g"),
-        F.col("nutriments.fat_100g").cast("double").alias("fat_g_per_100g"),
+        nutriment("energy-kcal_100g").alias("kcal_per_100g"),
+        nutriment("proteins_100g").alias("protein_g_per_100g"),
+        nutriment("carbohydrates_100g").alias("carb_g_per_100g"),
+        nutriment("fat_100g").alias("fat_g_per_100g"),
 
-        (has_tag(labels, "vegetarian") | has_tag(labels, "vegan")).alias("is_vegetarian"),
-        has_tag(labels, "vegan").alias("is_vegan"),
-        any_token(ingredients_col, PORK_TOKENS).alias("contains_pork"),
-        any_token(ingredients_col, ALCOHOL_TOKENS).alias("contains_alcohol"),
-        (has_tag(allergens, "gluten") | any_token(ingredients_col, GLUTEN_TOKENS))
-            .alias("contains_gluten"),
-        (has_tag(allergens, "milk") | any_token(ingredients_col, LACTOSE_TOKENS))
-            .alias("contains_lactose"),
-        (has_tag(allergens, "nuts", "peanut") | any_token(ingredients_col, NUT_TOKENS))
-            .alias("contains_nuts"),
+        label_vegetarian.alias("is_vegetarian"),
+        label_vegan.alias("is_vegan"),
+        pork.alias("contains_pork"),
+        alcohol.alias("contains_alcohol"),
+        # An explicit "free from" label beats a token match.
+        (~label_no_gluten & (has_tag(allergens, "gluten")
+                             | has_token(ingredients_blob, GLUTEN_TOKENS))).alias("contains_gluten"),
+        (~label_no_lactose & (has_tag(allergens, "milk")
+                              | has_token(ingredients_blob, LACTOSE_TOKENS))).alias("contains_lactose"),
+        (has_tag(allergens, "nuts", "peanut")
+         | has_token(ingredients_blob, NUT_TOKENS)).alias("contains_nuts"),
 
         halal_status.alias("halal_status"),
         halal_reason.alias("halal_reason"),
-        ingredients_col.alias("ingredients_text"),
     )
-    # A protein source if it actually carries meaningful protein.
     .withColumn("is_protein_source", F.col("protein_g_per_100g") >= F.lit(10.0))
     # Spices and oils must not scale linearly when a recipe is tripled.
     .withColumn(
         "scaling_class",
         F.when(
-            any_token(F.col("canonical_name"),
+            has_token(F.lower(F.col("canonical_name")),
                       ["salt", "suola", "pepper", "pippuri", "chilli", "chili",
-                       "spice", "mauste", "garam", "cumin", "kumina", "oil", "öljy"]),
+                       "spice", "mauste", "garam", "cumin", "kumina", "oil", "oljy"]),
             F.lit("sublinear"),
         ).otherwise(F.lit("linear")),
     )
     .dropDuplicates(["off_code"])
 )
 
+curated.cache()
 print(f"curated: {curated.count()} products")
 display(curated.groupBy("halal_status").count().orderBy(F.desc("count")))
+
+# COMMAND ----------
+
+# Sanity check before loading - how much of the catalog is actually usable?
+display(
+    curated.agg(
+        F.count("*").alias("products"),
+        F.sum(F.col("kcal_per_100g").isNotNull().cast("int")).alias("with_kcal"),
+        F.sum(F.col("protein_g_per_100g").isNotNull().cast("int")).alias("with_protein"),
+        F.sum(F.col("name_fi").isNotNull().cast("int")).alias("with_finnish_name"),
+        F.sum(F.col("store_name").isNotNull().cast("int")).alias("with_store"),
+        F.sum(F.col("is_protein_source").cast("int")).alias("protein_sources"),
+    )
+)
 
 # COMMAND ----------
 
 # MAGIC %md ## 3. Load into Lakebase
 
 # COMMAND ----------
-
-JDBC_URL, JDBC_PROPS = None, None
-
 
 def lakebase_jdbc(url: str) -> tuple[str, dict]:
     """Turn a postgresql:// URL into JDBC url + connection properties."""
@@ -289,7 +446,7 @@ def lakebase_jdbc(url: str) -> tuple[str, dict]:
 JDBC_URL, JDBC_PROPS = lakebase_jdbc(LAKEBASE_URL)
 
 # Staging table, then an idempotent upsert. Writing straight into `ingredients`
-# would clobber the review state and any manually corrected rows.
+# would clobber manually corrected rows.
 (
     curated.write
     .mode("overwrite")
@@ -340,16 +497,14 @@ with psycopg2.connect(LAKEBASE_URL) as conn:
         upserted = cur.rowcount
         cur.execute("SELECT COUNT(*) FROM ingredients")
         total = cur.fetchone()[0]
-        cur.execute(
-            """
+        cur.execute("""
             SELECT halal_status, COUNT(*)
             FROM ingredients GROUP BY halal_status ORDER BY 2 DESC
-            """
-        )
+        """)
         breakdown = cur.fetchall()
     conn.commit()
 
-print(f"upserted {upserted} rows -> ingredients now has {total}")
+print(f"upserted {upserted} rows -> ingredients now has {total}\n")
 for status, n in breakdown:
     print(f"  {status:20s} {n}")
 
