@@ -150,10 +150,11 @@ print(f"{len(pending)} receipts to process ({len(done)} already extracted)")
 
 EXTRACTION_PROMPT = """You are reading a Finnish grocery receipt.
 
-Extract every purchased line item. Return STRICT JSON, no markdown fence, shaped:
+Extract every purchased line item. Return STRICT JSON only - no prose, no
+markdown fence - shaped exactly:
 
 {
-  "store": "Prisma" | "S-market" | "Lidl" | "K-Market" | "Alanya" | null,
+  "store": "the shop name exactly as printed at the top, or null",
   "purchased_on": "YYYY-MM-DD" or null,
   "total_eur": number or null,
   "confidence": 0.0-1.0,
@@ -169,12 +170,61 @@ Extract every purchased line item. Return STRICT JSON, no markdown fence, shaped
   ]
 }
 
-Rules:
-- Keep raw_text EXACTLY as printed, including Finnish abbreviations.
-- price_eur is what was actually paid for that line, after any discount shown.
-- Skip deposit lines (PANTTI), bag purchases, loyalty discounts and the total row.
-- If a pack size appears in the name (e.g. "700G"), put it in quantity/unit.
-- Set a low confidence on any line you had to guess at. Do not invent items.
+NUMBERS AND DATES - these are Finnish conventions and get this wrong often:
+- Prices use a decimal COMMA. "3,07" means 3.07 - emit it as the JSON number
+  3.07, never as a string and never as 307.
+- Thousands may use a space or dot: "1 234,56" means 1234.56.
+- Dates print as D.M.YYYY. "27.6.2026" must become "2026-06-27".
+
+ITEM LAYOUT - most Finnish tills print ONE ITEM ACROSS TWO LINES:
+
+    Chicken feet 1kg                 <- line 1: the product name
+    1,00X    3,30            3,30    <- line 2: qty X unit-price, then total
+
+    Kanan Rintafile
+    104165      1,325X   8,49   11,25
+
+  On the second line a leading number is a product/barcode code - ignore it.
+  "1,325X  8,49  11,25" means 1.325 units at 8.49 each, 11.25 paid.
+
+  price_eur is ALWAYS the RIGHTMOST number (what was actually paid), never
+  the unit price. For "1,325X 8,49 11,25" -> price_eur 11.25, quantity 1.325.
+
+WEIGHT-PRICED ITEMS:
+  A fractional quantity (1,325X / 2,385X / 0,445X) means the item was weighed
+  and priced per kilo. Set quantity to that number and unit to "kg".
+  A whole quantity (1,00X / 2,000X) means pieces - if the NAME contains a pack
+  size ("800g", "1kg", "6kpl", "1L"), use that as quantity/unit instead.
+
+DISCOUNTS:
+  A line like "-50,00 %" or "-50,%" applies to the item above it. Always use
+  the final amount paid, not the pre-discount price.
+
+WHICH LINES ARE ITEMS:
+- Items sit between the dashed separator lines.
+- The store name is on the first line - copy it as printed, e.g.
+  "Alanya Market Itis" or "S-MARKET ITAKESKUS".
+
+NEVER treat these as items - Finnish receipts are full of them:
+- YHTEENSA (total), VALISUMMA (subtotal)
+- ALV / VEROTON / VERO / VEROLLINEN (the VAT breakdown table)
+- BONUSTA KERRYTTAVAT OSTOT, Jasennumero, Bonustapahtuma (loyalty)
+- CARD TRANSACTION and everything after it: Card, Application, Tr.Nr/Auth,
+  Payee/business, Reference, Debit/Charge, PayPass
+- PANTTI (bottle deposit), MUOVIKASSI / KASSI (carrier bag)
+- Opening hours, phone numbers, business IDs (Y-tunnus), marketing text
+- Policy notices printed BETWEEN items, e.g. "Lahjatavaroilla ei ole vaihto-
+  eika palautus oikeutta!" - these interrupt the item list, skip them and
+  carry on with the next real item
+
+OTHER RULES:
+- Keep raw_text EXACTLY as printed, including Finnish abbreviations and
+  capitalisation ("BROIL.FILE 700G").
+- price_eur is what was actually paid for that line, after any discount.
+- If a pack size appears in the name ("700G", "1L"), put it in quantity/unit.
+  Many receipt lines have no size at all - then use null, don't guess.
+- Set a low confidence on any line you had to guess at. Never invent items.
+- If the receipt has no purchasable items, return "items": [].
 """
 
 
@@ -278,6 +328,47 @@ VALUES (%s, %s, %s, %s, %s, %s, %s)
 RETURNING receipt_id
 """
 
+# Receipts name shops in ways the stores table doesn't ("S-MARKET ITAKESKUS",
+# "Alanya Market Itis"), and you shop at places that were never seeded at all.
+# Falling back to DEFAULT_STORE would file an Asian grocer's prices under
+# Prisma, quietly corrupting the provenance the whole design rests on.
+STORE_ALIASES = [
+    ("prisma", "Prisma"),
+    ("s-market", "S-market"),
+    ("smarket", "S-market"),
+    ("alanya", "Alanya"),
+    ("lidl", "Lidl"),
+    ("k-market", "K-Market"),
+    ("k-supermarket", "K-Market"),
+    ("k-citymarket", "K-Market"),
+]
+
+
+def resolve_store(printed_name: str | None) -> str:
+    """Map a printed shop name to a stores.name, creating it if it's new."""
+    if not printed_name:
+        return DEFAULT_STORE
+
+    low = printed_name.strip().lower()
+    for needle, canonical in STORE_ALIASES:
+        if needle in low:
+            return canonical
+
+    # Unknown shop: register it rather than mis-filing its prices. halal_certified
+    # stays false - only you can assert that, via the app.
+    clean = " ".join(printed_name.split())[:80]
+    with psycopg2.connect(LAKEBASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO stores (name, chain, city, notes)
+                   VALUES (%s, NULL, NULL, 'auto-added from a receipt')
+                   ON CONFLICT (name) DO NOTHING""",
+                (clean,),
+            )
+        conn.commit()
+    print(f"    registered new store: {clean}")
+    return clean
+
 INSERT_LINE = """
 INSERT INTO receipt_line_items
     (receipt_id, raw_text, quantity, unit, price_eur, confidence)
@@ -289,22 +380,56 @@ VALUES (%s, %s, %s, %s, %s, %s)
 # treated as untrusted input. One malformed date ("2026-13-45", "last Tuesday")
 # would otherwise abort the whole receipt batch.
 def safe_date(value):
-    from datetime import date
+    """Parse a date, accepting ISO and the Finnish D.M.YYYY form.
+
+    Receipts print "27.6.2026", so ISO-only parsing would throw away the
+    purchase date on every single one - which in turn makes captured_at wrong
+    and breaks any 'price as of' claim in the UI.
+    """
+    from datetime import date, datetime
 
     if not value:
         return None
+    text = str(value).strip()
+
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text[:10], fmt).date()
+        except ValueError:
+            continue
     try:
-        return date.fromisoformat(str(value)[:10])
+        return date.fromisoformat(text[:10])
     except (ValueError, TypeError):
         print(f"    ignoring unparseable date: {value!r}")
         return None
 
 
 def safe_number(value):
+    """Parse a number, accepting the European decimal comma.
+
+    Finnish receipts print "3,07" and "1 234,56". float("3,07") raises, so
+    without this every price would come back None and the line would be
+    dropped as priceless - silent, total data loss.
+    """
     if value is None or isinstance(value, bool):
         return None
-    try:
+    if isinstance(value, (int, float)):
         return float(value)
+
+    text = str(value).strip()
+    # strip currency symbols, spaces and non-breaking spaces used as separators
+    text = re.sub(r"[€$£\s ]", "", text)
+    if not text:
+        return None
+
+    if "," in text:
+        # "1.234,56" -> thousands dot; "3,07" -> decimal comma
+        if "." in text and text.rfind(".") < text.rfind(","):
+            text = text.replace(".", "")
+        text = text.replace(",", ".")
+
+    try:
+        return float(text)
     except (ValueError, TypeError):
         return None
 
@@ -314,7 +439,7 @@ with psycopg2.connect(LAKEBASE_URL) as conn:
         for r in results:
             cur.execute(INSERT_RECEIPT, (
                 r["_path"],
-                r.get("store") or DEFAULT_STORE,
+                resolve_store(r.get("store")),
                 safe_date(r.get("purchased_on")),
                 safe_number(r.get("total_eur")),
                 json.dumps(r),
