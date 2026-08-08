@@ -31,7 +31,7 @@
 dbutils.widgets.text("volume_path", "/Volumes/workspace/default/receipts", "Receipt volume (jpg/png/pdf)")
 dbutils.widgets.text("vision_endpoint", "databricks-llama-4-maverick", "Vision serving endpoint")
 dbutils.widgets.text("default_store", "Prisma", "Store when the receipt doesn't say")
-dbutils.widgets.text("lakebase_scope", "database", "Secret scope")
+dbutils.widgets.text("lakebase_scope", "mealplan", "Secret scope")
 dbutils.widgets.text("lakebase_key", "lakebase-url", "Secret key")
 dbutils.widgets.dropdown("reprocess", "false", ["true", "false"], "Re-extract already-done receipts")
 

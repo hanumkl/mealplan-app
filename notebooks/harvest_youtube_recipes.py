@@ -32,7 +32,7 @@
 # MAGIC and every recipe carries an `extraction_confidence` so bad parses can be
 # MAGIC reviewed rather than silently planned around.
 # MAGIC
-# MAGIC Requires: `mealplan/youtube-api-key` secret, `database/lakebase-url`, and
+# MAGIC Requires: `mealplan/youtube-api-key`, `mealplan/lakebase-url`, and
 # MAGIC `sql/07_vectors.sql` applied.
 
 # COMMAND ----------
@@ -53,7 +53,7 @@ dbutils.widgets.text("max_per_query", "25", "Videos per query")
 dbutils.widgets.text("staging_volume", "/Volumes/workspace/default/raw", "Volume for raw JSON")
 dbutils.widgets.text("llm_endpoint", "databricks-llama-4-maverick", "LLM serving endpoint")
 dbutils.widgets.text("min_confidence", "0.5", "Auto-approve recipes at or above this")
-dbutils.widgets.text("lakebase_scope", "database", "Lakebase secret scope")
+dbutils.widgets.text("lakebase_scope", "mealplan", "Lakebase secret scope")
 dbutils.widgets.text("lakebase_key", "lakebase-url", "Lakebase secret key")
 dbutils.widgets.text("youtube_scope", "mealplan", "YouTube secret scope")
 dbutils.widgets.text("youtube_key_name", "youtube-api-key", "YouTube secret key")

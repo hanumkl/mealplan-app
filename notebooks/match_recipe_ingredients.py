@@ -41,7 +41,7 @@ dbutils.widgets.text("nutrition_margin", "0.10",
 dbutils.widgets.text("batch_size", "256", "Encode batch size")
 dbutils.widgets.dropdown("rematch_all", "false", ["true", "false"],
                          "Re-match rows that already have a match")
-dbutils.widgets.text("lakebase_scope", "database", "Secret scope")
+dbutils.widgets.text("lakebase_scope", "mealplan", "Secret scope")
 dbutils.widgets.text("lakebase_key", "lakebase-url", "Secret key")
 
 MODEL_NAME = dbutils.widgets.get("model_name")

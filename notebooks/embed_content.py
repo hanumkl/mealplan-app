@@ -37,7 +37,7 @@ dbutils.widgets.text("chunk_size", "600", "Instruction chunk size (chars)")
 dbutils.widgets.text("chunk_overlap", "80", "Chunk overlap (chars)")
 dbutils.widgets.dropdown("reembed_all", "false", ["true", "false"],
                          "Re-embed everything (e.g. after a model change)")
-dbutils.widgets.text("lakebase_scope", "database", "Secret scope")
+dbutils.widgets.text("lakebase_scope", "mealplan", "Secret scope")
 dbutils.widgets.text("lakebase_key", "lakebase-url", "Secret key")
 
 MODEL_NAME = dbutils.widgets.get("model_name")

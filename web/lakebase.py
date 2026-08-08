@@ -17,7 +17,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from sqlalchemy import create_engine
 
-_SCOPE = os.environ.get("LAKEBASE_SECRET_SCOPE", "database")
+_SCOPE = os.environ.get("LAKEBASE_SECRET_SCOPE", "mealplan")
 _KEY = os.environ.get("LAKEBASE_SECRET_KEY", "lakebase-url")
 
 _cached_url: str | None = None

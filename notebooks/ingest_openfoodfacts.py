@@ -59,7 +59,7 @@ dbutils.widgets.text("request_interval_seconds", "2", "api mode: seconds between
 dbutils.widgets.text("max_retries", "4", "api mode: retries per page on 429/5xx")
 dbutils.widgets.text("staging_volume", "/Volumes/workspace/default/raw", "api mode: Volume for raw JSON")
 dbutils.widgets.text("dump_path", "/Volumes/main/mealplan/off/food.parquet", "dump mode: Volume path")
-dbutils.widgets.text("lakebase_scope", "database", "Secret scope")
+dbutils.widgets.text("lakebase_scope", "mealplan", "Secret scope")
 dbutils.widgets.text("lakebase_key", "lakebase-url", "Secret key")
 
 SOURCE_MODE = dbutils.widgets.get("source_mode")

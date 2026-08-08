@@ -79,6 +79,13 @@ Do this first — provisioning takes real wall-clock time.
 
 ### 2. Store secrets
 
+> **Use the `mealplan` scope, not `database`.** Every project in the bootcamp
+> defaults to `database/lakebase-url`, so setting up a second one overwrites
+> this project's connection. The symptom is baffling: notebooks report
+> `relation "recipes" does not exist` for tables you can plainly see in the
+> catalog browser, because they're connected to a different Lakebase entirely.
+> Print `current_database()` and the connection user if that ever happens.
+
 Once the repo is in a Databricks Git folder (step 4), run from a notebook in
 that folder:
 
@@ -99,12 +106,12 @@ from databricks.sdk.service import workspace
 
 w = WorkspaceClient()
 try:
-    w.secrets.create_scope(scope="database")
+    w.secrets.create_scope(scope="mealplan")
 except Exception as e:
     print(e)
-w.secrets.put_secret(scope="database", key="lakebase-url",
+w.secrets.put_secret(scope="mealplan", key="lakebase-url",
                      string_value=getpass.getpass("Lakebase URL: "))
-w.secrets.put_acl(scope="database", principal="users",
+w.secrets.put_acl(scope="mealplan", principal="users",
                   permission=workspace.AclPermission.READ)
 ```
 

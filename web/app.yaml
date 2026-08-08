@@ -4,7 +4,7 @@ command:
 
 env:
   - name: LAKEBASE_SECRET_SCOPE
-    value: "database"
+    value: "mealplan"
   - name: LAKEBASE_SECRET_KEY
     value: "lakebase-url"
   - name: DEFAULT_HOUSEHOLD_ID

@@ -39,16 +39,20 @@ def grant_read(scope: str) -> None:
 
 
 # --- Lakebase (required for Stage 1) ---------------------------------------
-ensure_scope("database")
+#
+# Deliberately `mealplan/lakebase-url`, not the bootcamp's `database/lakebase-url`.
+# Every project in the course uses that same default name, so setting up a
+# second one silently repoints this project at the wrong database - the
+# notebooks then fail with "relation does not exist" against tables that
+# plainly exist, which is a genuinely confusing hour to lose.
+ensure_scope("mealplan")
 lakebase_url = getpass.getpass("Paste your Lakebase connection URL: ").strip()
 if lakebase_url:
-    w.secrets.put_secret(scope="database", key="lakebase-url", string_value=lakebase_url)
-    print("stored database/lakebase-url")
-grant_read("database")
+    w.secrets.put_secret(scope="mealplan", key="lakebase-url", string_value=lakebase_url)
+    print("stored mealplan/lakebase-url")
 
 
 # --- YouTube Data API v3 (needed from Stage 2 onward) ----------------------
-ensure_scope("mealplan")
 youtube_key = getpass.getpass("Paste your YouTube Data API key (Enter to skip): ").strip()
 if youtube_key:
     w.secrets.put_secret(scope="mealplan", key="youtube-api-key", string_value=youtube_key)
