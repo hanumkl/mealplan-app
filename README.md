@@ -160,7 +160,32 @@ vision path entirely and are read exactly.
    Postgres — never search at request time.
 4. Run `notebooks/embed_content.py`. It reads the `*_needing_embedding` views,
    so re-running only embeds what's new.
-5. Redeploy the app. The **Recipes** tab lights up.
+5. Run `sql/08_recipe_matching.sql`, then `notebooks/match_recipe_ingredients.py`.
+6. Redeploy the app. The **Recipes** tab lights up.
+
+### 7. Why matching matters
+
+Step 5 is what turns a recipe from text into something plannable. The recipe
+says `chicken thigh`; the catalog says `Broilerin koipireisi`. Until those are
+linked there are no calories, no protein and no euro cost — which also means no
+grocery list total.
+
+String matching can't bridge Indonesian recipe text to a Finnish product
+catalog, which is exactly why the embeddings are multilingual. The matcher
+takes the 10 nearest catalog entries and prefers one that actually carries
+nutrition data, since a marginally-closer product with no calories is useless
+here.
+
+Below the similarity threshold it leaves the row **unmatched rather than
+guessing**. A wrong match silently skews a week of nutrition; a missing one
+shows up in the app as `unmatched`, and you can fix it by clicking it. Your
+choice is recorded as `manual` and the notebook never overwrites it — same rule
+as halal confirmation.
+
+The recipe view shows totals next to their coverage (“based on 8 of 11
+ingredients”), and marks spoon and volume measures as estimates. A partial
+total presented as complete is how someone ends up bulking on a plan that's
+800 kcal short.
 
 **The one rule for embeddings:** content and query must use the *same* model.
 Two models produce vectors of the same length that mean different things —

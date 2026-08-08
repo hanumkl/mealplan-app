@@ -774,6 +774,7 @@ let openRecipeServings = null;
 // Taken from the detail payload, not the search results - the search SELECT
 // doesn't carry video_id, so deep-links would silently lose their timestamps.
 let openRecipeVideoId = null;
+let recipeIngredients = [];
 
 $("#recipes-body").addEventListener("click", (e) => {
   const card = e.target.closest("[data-recipe]");
@@ -806,6 +807,7 @@ async function openRecipe(recipeId, servings = null) {
   const r = data.recipe;
   openRecipeServings = data.servings;
   openRecipeVideoId = r.video_id || null;
+  recipeIngredients = data.ingredients;
   $("#recipe-dialog-title").textContent = r.title;
 
   const fmtQty = (row) => {
@@ -834,18 +836,96 @@ async function openRecipe(recipeId, servings = null) {
             <tr class="${row.is_optional ? "optional" : ""}">
               <td class="ingr-qty">${fmtQty(row)}</td>
               <td>
-                <div>${esc(row.canonical_name || row.raw_text)}</div>
-                ${row.canonical_name && row.raw_text !== row.canonical_name
-                  ? `<div class="faint" style="font-size:11.5px">“${esc(row.raw_text)}”</div>`
+                <div>${esc(row.ingredient_name || row.raw_text)}</div>
+                ${row.canonical_name
+                  ? `<div class="faint" style="font-size:11.5px">
+                       → ${esc(row.canonical_name)}
+                       ${row.match_method === "manual"
+                         ? '<span class="lock">🔒</span>'
+                         : row.match_confidence
+                         ? `<span title="match confidence">${Math.round(row.match_confidence * 100)}%</span>`
+                         : ""}
+                     </div>`
                   : ""}
+              </td>
+              <td class="num">
+                ${row.line_cost_eur !== null && row.line_cost_eur !== undefined
+                  ? `€${num(row.line_cost_eur, 2)}` : ""}
               </td>
               <td class="num">${scalingHint(row)}
                 ${row.is_optional ? '<span class="badge">optional</span>' : ""}
-                ${row.ingredient_id ? "" : '<span class="badge warn" title="No catalog match - not priced or diet-checked">unmatched</span>'}
+                ${row.grams_quality === "approximate"
+                  ? '<span class="badge" title="Volume or spoon measure converted at water density — an estimate">≈</span>' : ""}
+                ${row.ingredient_id
+                  ? ""
+                  : `<span class="badge warn badge-action" data-match="${row.ri_id}"
+                           title="No catalog match — click to pick one. Not counted in nutrition or cost.">unmatched</span>`}
               </td>
             </tr>`).join("")}
         </tbody>
       </table>
+    </div>`;
+
+  // Totals are only as good as the matching, so coverage is shown next to them
+  // rather than buried. A partial total presented as complete is how someone
+  // ends up bulking on a plan that is 800 kcal short.
+  const t = data.totals;
+  const ps = data.per_serving;
+  const nutritionPanel = `
+    <div class="nutri-panel">
+      <div class="nutri-row">
+        <div class="nutri-cell">
+          <div class="nutri-value">${t.ingredients_counted ? num(ps.kcal) : "—"}</div>
+          <div class="nutri-label">kcal / serving</div>
+        </div>
+        <div class="nutri-cell">
+          <div class="nutri-value">${t.ingredients_counted ? num(ps.protein_g, 1) + " g" : "—"}</div>
+          <div class="nutri-label">protein / serving</div>
+        </div>
+        <div class="nutri-cell">
+          <div class="nutri-value">${ps.cost_eur !== null && ps.cost_eur !== undefined
+            ? "€" + num(ps.cost_eur, 2) : "—"}</div>
+          <div class="nutri-label">cost / serving</div>
+        </div>
+        <div class="nutri-cell">
+          <div class="nutri-value">${t.cost_eur !== null && t.cost_eur !== undefined
+            ? "€" + num(t.cost_eur, 2) : "—"}</div>
+          <div class="nutri-label">cost to cook</div>
+        </div>
+      </div>
+      ${t.is_complete && !t.is_approximate ? "" : `
+        <div class="nutri-note">
+          ${t.ingredients_counted === 0
+            ? `⚠️ Nothing matched the catalog yet, so there are no numbers to show.
+               Run <span class="mono">notebooks/match_recipe_ingredients.py</span>.`
+            : `Based on ${t.ingredients_counted} of ${t.ingredients_total} ingredients${
+                t.ingredients_priced ? `, ${t.ingredients_priced} priced` : ", none priced"}.
+               ${t.is_approximate ? "Spoon and volume measures are estimates. " : ""}
+               ${t.missing.length ? `Not counted: ${t.missing.map(esc).join(", ")}.` : ""}`}
+        </div>`}
+    </div>`;
+
+  const memberFit = !data.member_fit.length ? "" : `
+    <div class="ingr-group">
+      <div class="ingr-caption">Portions for your goals</div>
+      <table class="ingr-table">
+        <tbody>
+          ${data.member_fit.map((m) => `
+            <tr>
+              <td><div>${esc(m.name)}</div>
+                  <div class="faint" style="font-size:11.5px">${esc(m.goal_type)} ·
+                    ${num(m.target_kcal)} kcal/day</div></td>
+              <td class="num ingr-qty">${num(m.servings_needed, 2)}×</td>
+              <td class="faint" style="font-size:11.5px">
+                serving${m.servings_needed === 1 ? "" : "s"} to cover lunch + dinner
+              </td>
+            </tr>`).join("")}
+        </tbody>
+      </table>
+      <div class="faint" style="font-size:11.5px">
+        Assumes this dish covers lunch and dinner — about 65% of the day's
+        calories. Breakfast and snacks are outside the plan.
+      </div>
     </div>`;
 
   const videoId = r.video_id || "";
@@ -876,8 +956,12 @@ async function openRecipe(recipeId, servings = null) {
 
     <div class="badges" style="margin:12px 0">${dietBadges(r)} ${confidenceBadge(r)}</div>
 
+    ${nutritionPanel}
+
     ${ingredientTable(base, "Base dish — cooked once, covers lunch and dinner")}
     ${ingredientTable(proteins, "Protein add-ons — per member, cooked separately")}
+
+    ${memberFit}
 
     ${data.ingredients.length ? "" :
       `<div class="note warn"><span>⚠️</span><div>No ingredients were extracted
@@ -906,7 +990,92 @@ $("#recipe-dialog-body").addEventListener("click", async (e) => {
     return;
   }
   if (e.target.closest("#btn-step-search")) runStepSearch();
+
+  const unmatched = e.target.closest("[data-match]");
+  if (unmatched) openMatchDialog(Number(unmatched.dataset.match));
 });
+
+/* --------------------------------------------- manual ingredient matching */
+
+let matchingRiId = null;
+
+function openMatchDialog(riId) {
+  matchingRiId = riId;
+  const row = (recipeIngredients || []).find((r) => r.ri_id === riId);
+  $("#match-raw-text").textContent = row?.ingredient_name || row?.raw_text || "";
+  $("#match-search").value = row?.ingredient_name || "";
+  $("#match-results").innerHTML = "";
+  $("#match-dialog").showModal();
+  if ($("#match-search").value) runMatchSearch();
+}
+
+async function runMatchSearch() {
+  const q = $("#match-search").value.trim();
+  const out = $("#match-results");
+  if (!q) return;
+  out.innerHTML = `<div class="faint" style="font-size:12px">Searching…</div>`;
+
+  // Semantic first so "chicken" finds "Broilerin fileesuikale"; the plain
+  // catalog search is the fallback when embeddings aren't built yet.
+  let rows = [];
+  try {
+    const sem = await api(`/api/search/ingredients?q=${encodeURIComponent(q)}&limit=12`);
+    rows = sem.results || [];
+    if (!rows.length) rows = await api(`/api/ingredients?q=${encodeURIComponent(q)}&limit=12`);
+  } catch {
+    rows = await api(`/api/ingredients?q=${encodeURIComponent(q)}&limit=12`);
+  }
+
+  if (!rows.length) {
+    out.innerHTML = `<div class="faint" style="font-size:12px">No catalog matches.</div>`;
+    return;
+  }
+
+  out.innerHTML = `
+    <table class="ingr-table"><tbody>
+      ${rows.map((r) => `
+        <tr class="match-option" data-pick="${r.ingredient_id}">
+          <td>
+            <div>${esc(r.canonical_name)}</div>
+            <div class="faint" style="font-size:11.5px">
+              ${r.name_en ? esc(r.name_en) + " · " : ""}
+              ${r.kcal_per_100g ? num(r.kcal_per_100g) + " kcal/100g"
+                : '<span style="color:var(--amber)">no nutrition data</span>'}
+            </div>
+          </td>
+          <td class="num faint" style="font-size:11.5px">
+            ${r.similarity ? Math.round(r.similarity * 100) + "%" : ""}
+          </td>
+        </tr>`).join("")}
+    </tbody></table>`;
+}
+
+$("#btn-match-search").addEventListener("click", runMatchSearch);
+$("#match-search").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); runMatchSearch(); }
+});
+
+$("#match-results").addEventListener("click", async (e) => {
+  const pick = e.target.closest("[data-pick]");
+  if (!pick) return;
+  await saveMatch(Number(pick.dataset.pick));
+});
+
+$("#match-clear").addEventListener("click", () => saveMatch(null));
+
+async function saveMatch(ingredientId) {
+  try {
+    await api(`/api/recipe-ingredients/${matchingRiId}/match`, {
+      method: "PUT",
+      body: { ingredient_id: ingredientId },
+    });
+    toast(ingredientId ? "Matched — nutrition and cost updated" : "Match cleared");
+    $("#match-dialog").close();
+    await openRecipe(openRecipeId);      // refresh totals
+  } catch (err) {
+    toast(err.message, "bad");
+  }
+}
 
 $("#recipe-dialog-body").addEventListener("keydown", (e) => {
   if (e.target.id === "step-search" && e.key === "Enter") {

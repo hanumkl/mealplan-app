@@ -349,6 +349,27 @@
   </div>
 </dialog>
 
+<dialog id="match-dialog">
+  <div class="dialog-head">Match to catalog — <span id="match-raw-text"></span></div>
+  <div class="dialog-body">
+    <div class="form-row" style="grid-template-columns:1fr auto">
+      <input type="text" id="match-search" placeholder="Search your catalog — chicken, riisi…">
+      <button class="btn btn-sm" id="btn-match-search">Search</button>
+    </div>
+    <div id="match-results"></div>
+    <div class="note info">
+      <span>ℹ️</span>
+      <div>Picking one here marks it as your decision, and the matching
+        notebook will never overwrite it. Only ingredients with nutrition data
+        count toward the recipe's calories.</div>
+    </div>
+  </div>
+  <div class="dialog-foot">
+    <button type="button" class="btn btn-ghost btn-danger" id="match-clear">Clear match</button>
+    <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+  </div>
+</dialog>
+
 <div class="toast-host" id="toasts"></div>
 
 <script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>

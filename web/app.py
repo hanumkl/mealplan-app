@@ -24,6 +24,7 @@ except ImportError:
 import embeddings
 from lakebase import run_one, run_query, run_returning, run_write
 from nutrition import calculate_targets, scale_quantity
+from units import price_for_grams, to_grams
 
 app = Flask(__name__)
 
@@ -690,9 +691,113 @@ def semantic_recipe_search():
     })
 
 
+# One cooking session covers lunch and dinner, so a serving is roughly two of
+# the day's three eating occasions. Breakfast and snacks are outside the plan.
+LUNCH_DINNER_SHARE = 0.65
+
+
+def _nutrition_and_cost(ingredients: list[dict]) -> dict:
+    """Total kcal/protein/cost for a scaled ingredient list.
+
+    Reports coverage alongside the totals. A recipe where the chicken failed to
+    match would otherwise return a confident-looking 300 kcal, and someone
+    bulking would plan around a number that is simply wrong.
+    """
+    totals = {"kcal": 0.0, "protein_g": 0.0, "carb_g": 0.0, "fat_g": 0.0}
+    cost = 0.0
+    counted = priced = 0
+    approximate = False
+    unconvertible: list[str] = []
+
+    for row in ingredients:
+        grams, quality = to_grams(row.get("scaled_quantity"), row.get("unit"))
+        row["grams"] = None if grams is None else round(grams, 1)
+        row["grams_quality"] = quality
+        if quality == "approximate":
+            approximate = True
+
+        if grams is None or row.get("ingredient_id") is None:
+            if not row.get("is_optional"):
+                unconvertible.append(row.get("ingredient_name")
+                                     or row.get("raw_text") or "?")
+            continue
+
+        if row.get("kcal_per_100g") is None:
+            unconvertible.append(row.get("canonical_name") or "?")
+            continue
+
+        share = grams / 100.0
+        totals["kcal"] += float(row["kcal_per_100g"]) * share
+        for key, col in (("protein_g", "protein_g_per_100g"),
+                         ("carb_g", "carb_g_per_100g"),
+                         ("fat_g", "fat_g_per_100g")):
+            if row.get(col) is not None:
+                totals[key] += float(row[col]) * share
+        counted += 1
+
+        line_cost = price_for_grams(grams, row.get("unit_price_eur"),
+                                    row.get("unit_basis"))
+        row["line_cost_eur"] = None if line_cost is None else round(line_cost, 2)
+        if line_cost is not None:
+            cost += line_cost
+            priced += 1
+
+    total = len(ingredients)
+    return {
+        "kcal": round(totals["kcal"]),
+        "protein_g": round(totals["protein_g"], 1),
+        "carb_g": round(totals["carb_g"], 1),
+        "fat_g": round(totals["fat_g"], 1),
+        "cost_eur": round(cost, 2) if priced else None,
+        "ingredients_total": total,
+        "ingredients_counted": counted,
+        "ingredients_priced": priced,
+        # True only when every non-optional line contributed. Anything less and
+        # the UI must present these as partial.
+        "is_complete": counted == total and total > 0,
+        "is_approximate": approximate,
+        "missing": unconvertible[:8],
+    }
+
+
+def _member_fit(per_serving_kcal: float, per_serving_protein: float) -> list[dict]:
+    """How many servings each member needs to hit their goal for the day."""
+    if not per_serving_kcal:
+        return []
+    members = run_query(
+        """
+        SELECT m.member_id, m.name, g.goal_type, g.target_kcal, g.target_protein_g
+        FROM members m
+        JOIN member_goals g ON g.member_id = m.member_id AND g.is_active
+        WHERE m.household_id = %s
+        ORDER BY m.member_id
+        """,
+        (DEFAULT_HOUSEHOLD_ID,),
+    )
+    out = []
+    for m in members:
+        target_kcal = float(m["target_kcal"]) if m["target_kcal"] else None
+        if not target_kcal:
+            continue
+        meal_kcal = target_kcal * LUNCH_DINNER_SHARE
+        out.append({
+            "member_id": m["member_id"],
+            "name": m["name"],
+            "goal_type": m["goal_type"],
+            "target_kcal": int(target_kcal),
+            "meal_kcal_target": int(round(meal_kcal)),
+            "servings_needed": round(meal_kcal / per_serving_kcal, 2),
+            "protein_from_one_serving": round(per_serving_protein, 1),
+            "target_protein_g": (float(m["target_protein_g"])
+                                 if m["target_protein_g"] else None),
+        })
+    return out
+
+
 @app.get("/api/recipes/<int:recipe_id>")
 def recipe_detail(recipe_id: int):
-    """Full recipe, with ingredients scaled to the requested servings."""
+    """Full recipe: ingredients scaled to the requested servings, plus the
+    nutrition and cost that the catalogue match makes possible."""
     recipe = run_one("SELECT * FROM recipes WHERE recipe_id = %s", (recipe_id,))
     if recipe is None:
         return jsonify({"error": "recipe not found"}), 404
@@ -704,6 +809,8 @@ def recipe_detail(recipe_id: int):
     ingredients = run_query(
         """
         SELECT ri.*, i.canonical_name, i.name_en, i.name_fi, i.halal_status,
+               i.kcal_per_100g, i.protein_g_per_100g,
+               i.carb_g_per_100g, i.fat_g_per_100g,
                p.unit_price_eur, p.unit_basis, p.store_name
         FROM recipe_ingredients ri
         LEFT JOIN ingredients i ON i.ingredient_id = ri.ingredient_id
@@ -725,13 +832,56 @@ def recipe_detail(recipe_id: int):
             else round(scale_quantity(float(qty), factor, row["scaling_class"]), 2)
         )
 
+    totals = _nutrition_and_cost(ingredients)
+    effective_servings = servings or base
+    per_serving_kcal = (totals["kcal"] / effective_servings
+                        if effective_servings else 0)
+    per_serving_protein = (totals["protein_g"] / effective_servings
+                           if effective_servings else 0)
+
     return jsonify({
         "recipe": recipe,
         "ingredients": ingredients,
-        "servings": servings or base,
+        "servings": effective_servings,
         "base_servings": base,
         "scale_factor": round(factor, 3),
+        "totals": totals,
+        "per_serving": {
+            "kcal": round(per_serving_kcal),
+            "protein_g": round(per_serving_protein, 1),
+            "cost_eur": (round(totals["cost_eur"] / effective_servings, 2)
+                         if totals["cost_eur"] and effective_servings else None),
+        },
+        "member_fit": _member_fit(per_serving_kcal, per_serving_protein),
     })
+
+
+@app.put("/api/recipe-ingredients/<int:ri_id>/match")
+def set_ingredient_match(ri_id: int):
+    """Correct a catalogue match by hand.
+
+    Marked 'manual' so the matching notebook never overwrites it - the same
+    rule as halal confirmation. Pass ingredient_id: null to clear a bad match.
+    """
+    ingredient_id = body().get("ingredient_id")
+    if ingredient_id is not None and not isinstance(ingredient_id, int):
+        return bad_request("ingredient_id must be an integer or null")
+
+    row = run_returning(
+        """
+        UPDATE recipe_ingredients
+           SET ingredient_id    = %s,
+               match_confidence = NULL,
+               match_method     = 'manual',
+               matched_at       = now()
+         WHERE ri_id = %s
+        RETURNING *
+        """,
+        (ingredient_id, ri_id),
+    )
+    if row is None:
+        return jsonify({"error": "recipe ingredient not found"}), 404
+    return jsonify(row)
 
 
 @app.get("/api/recipes/<int:recipe_id>/steps")

@@ -327,9 +327,9 @@ RETURNING recipe_id
 
 INSERT_RECIPE_INGREDIENT = """
 INSERT INTO recipe_ingredients
-    (recipe_id, raw_text, quantity, unit, scaling_class,
+    (recipe_id, raw_text, ingredient_name, quantity, unit, scaling_class,
      is_protein_component, is_optional, sort_order)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 # Spices and oils must not scale linearly when a recipe is tripled - same
@@ -485,6 +485,9 @@ with psycopg2.connect(LAKEBASE_URL) as conn:
                 cur.execute(INSERT_RECIPE_INGREDIENT, (
                     recipe_id,
                     str(ing.get("raw_text") or ing.get("name") or "")[:500],
+                    # Clean English name, kept separately - it is what the
+                    # catalogue matcher embeds.
+                    (str(ing["name"])[:200] if ing.get("name") else None),
                     safe_num(ing.get("quantity")),
                     ing.get("unit"),
                     scaling_class_for(ing.get("name")),

@@ -502,6 +502,33 @@ dialog.dialog-wide { max-width: 620px; width: calc(100vw - 32px); }
 .stepper { display: flex; align-items: center; gap: 10px; }
 .stepper-value { font-weight: 640; font-size: 16px; min-width: 22px; text-align: center; }
 
+.nutri-panel {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden; background: var(--surface);
+}
+.nutri-row { display: grid; grid-template-columns: repeat(4, 1fr); }
+.nutri-cell {
+  padding: 11px 8px; text-align: center;
+  border-right: 1px solid var(--border);
+}
+.nutri-cell:last-child { border-right: 0; }
+.nutri-value {
+  font-size: 18px; font-weight: 660; color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.nutri-label {
+  font-size: 10.5px; color: var(--text-muted); margin-top: 2px;
+  text-transform: uppercase; letter-spacing: .04em;
+}
+.nutri-note {
+  padding: 8px 12px; font-size: 11.5px; line-height: 1.5;
+  color: var(--text-muted); background: var(--surface-2);
+  border-top: 1px solid var(--border);
+}
+
+.match-option { cursor: pointer; }
+.match-option:hover { background: var(--accent-soft); }
+
 .ingr-group { display: flex; flex-direction: column; gap: 7px; }
 .ingr-caption {
   font-size: 11px; font-weight: 640; text-transform: uppercase;
