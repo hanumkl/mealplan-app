@@ -255,6 +255,53 @@
   </form>
 </dialog>
 
+<dialog id="halal-dialog">
+  <form method="dialog" id="halal-form">
+    <div class="dialog-head">Halal status — <span id="halal-product-name"></span></div>
+    <div class="dialog-body">
+      <div id="halal-derived"></div>
+
+      <div class="field">
+        <label class="label">Your decision</label>
+        <div class="choice-row">
+          <label class="choice">
+            <input type="radio" name="halal" value="certified">
+            <span><strong>Halal</strong><br><span class="faint">Safe for this household</span></span>
+          </label>
+          <label class="choice">
+            <input type="radio" name="halal" value="contains_flagged">
+            <span><strong>Not halal</strong><br><span class="faint">Never plan this</span></span>
+          </label>
+          <label class="choice">
+            <input type="radio" name="halal" value="unknown">
+            <span><strong>Unsure</strong><br><span class="faint">Leave unclassified</span></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="label" for="halal-note">Note (optional)</label>
+        <input type="text" id="halal-note"
+               placeholder="e.g. checked packaging, gelatine is beef">
+      </div>
+
+      <div class="note info">
+        <span>ℹ️</span>
+        <div>Your decision outranks whatever the pipeline derived, and survives
+          future ingestion runs. Only you can confirm this — the data source
+          can't.</div>
+      </div>
+    </div>
+    <div class="dialog-foot">
+      <button type="button" class="btn btn-ghost btn-danger" id="halal-clear">
+        Clear confirmation
+      </button>
+      <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+      <button type="submit" class="btn btn-primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
 <div class="toast-host" id="toasts"></div>
 
 <script type="module" src="{{ url_for('static', filename='js/app.js') }}"></script>

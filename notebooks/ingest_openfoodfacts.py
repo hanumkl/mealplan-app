@@ -694,8 +694,15 @@ ON CONFLICT (canonical_name) DO UPDATE SET
     protein_g_per_100g = COALESCE(EXCLUDED.protein_g_per_100g, ingredients.protein_g_per_100g),
     carb_g_per_100g    = COALESCE(EXCLUDED.carb_g_per_100g, ingredients.carb_g_per_100g),
     fat_g_per_100g     = COALESCE(EXCLUDED.fat_g_per_100g, ingredients.fat_g_per_100g),
-    halal_status       = EXCLUDED.halal_status,
-    halal_reason       = EXCLUDED.halal_reason,
+    -- A hand-confirmed halal status outranks anything derived here. Without
+    -- this guard every pipeline run would silently wipe the household's own
+    -- decisions and send those products back to 'unknown'.
+    halal_status       = CASE WHEN ingredients.halal_source = 'user_confirmed'
+                              THEN ingredients.halal_status
+                              ELSE EXCLUDED.halal_status END,
+    halal_reason       = CASE WHEN ingredients.halal_source = 'user_confirmed'
+                              THEN ingredients.halal_reason
+                              ELSE EXCLUDED.halal_reason END,
     updated_at         = now();
 """
 

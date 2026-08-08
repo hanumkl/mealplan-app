@@ -377,6 +377,26 @@ tbody tr:hover { background: var(--surface-2); }
 .pulse.ok   { background: var(--green); box-shadow: 0 0 0 3px var(--green-soft); }
 .pulse.bad  { background: var(--red);   box-shadow: 0 0 0 3px var(--red-soft); }
 
+/* Radio choices in the halal dialog */
+.choice-row { display: flex; flex-direction: column; gap: 7px; }
+.choice {
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px; line-height: 1.4;
+  transition: border-color .12s, background .12s;
+}
+.choice:hover { background: var(--surface-2); }
+.choice input { margin-top: 2px; accent-color: var(--accent); }
+.choice:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+
+/* Halal badge is interactive in the catalog */
+.badge-action { cursor: pointer; border: 1px dashed transparent; }
+.badge-action:hover { border-color: currentColor; }
+.badge .lock { font-size: 9px; opacity: .75; }
+
 .mono { font-family: var(--mono); font-size: 12px; }
 .muted { color: var(--text-muted); }
 .faint { color: var(--text-faint); }

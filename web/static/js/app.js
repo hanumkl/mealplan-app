@@ -390,12 +390,17 @@ $("#restriction-form").addEventListener("submit", async () => {
 
 /* --------------------------------------------------------------- catalog */
 
+// Kept at module scope so the halal dialog can look a row up by id without
+// re-fetching it.
+let catalogRows = [];
+
 async function loadCatalog() {
   const q = $("#ingredient-search").value.trim();
   const body = $("#catalog-body");
   body.innerHTML = `<div class="empty"><div class="empty-sub">Loading…</div></div>`;
 
   const rows = await api(`/api/ingredients?q=${encodeURIComponent(q)}&limit=100`);
+  catalogRows = rows;
 
   if (!rows.length) {
     body.innerHTML = `
@@ -423,12 +428,24 @@ async function loadCatalog() {
     return "";
   };
 
-  const halalBadge = (s) => ({
-    certified: `<span class="badge ok">certified</span>`,
-    likely_ok: `<span class="badge ok">likely ok</span>`,
-    contains_flagged: `<span class="badge strict">flagged</span>`,
-    unknown: `<span class="badge">unknown</span>`,
-  }[s] || "");
+  // Clickable: a household confirmation outranks the derived value, and a
+  // padlock marks the ones that are no longer guesses.
+  const halalBadge = (r) => {
+    const confirmed = r.halal_source === "user_confirmed";
+    const label = {
+      certified: confirmed ? "halal ✓" : "certified",
+      likely_ok: "likely ok",
+      contains_flagged: confirmed ? "not halal" : "flagged",
+      unknown: "unknown",
+    }[r.halal_status] || r.halal_status;
+    const tone = {
+      certified: "ok", likely_ok: "ok", contains_flagged: "strict", unknown: "",
+    }[r.halal_status] ?? "";
+    return `<span class="badge ${tone} badge-action" data-halal="${r.ingredient_id}"
+                  title="${esc(r.halal_reason || "")}">
+              ${label}${confirmed ? ' <span class="lock">🔒</span>' : ""}
+            </span>`;
+  };
 
   body.innerHTML = `
     <div class="table-wrap">
@@ -449,7 +466,7 @@ async function loadCatalog() {
               <td class="muted">${esc(r.category_en || r.category || "—")}</td>
               <td class="num">${num(r.kcal_per_100g)}</td>
               <td class="num">${num(r.protein_g_per_100g, 1)} g</td>
-              <td>${halalBadge(r.halal_status)}</td>
+              <td>${halalBadge(r)}</td>
               <td><div class="badges">
                 ${r.is_vegan ? '<span class="badge ok">vegan</span>'
                   : r.is_vegetarian ? '<span class="badge ok">veg</span>' : ""}
@@ -474,6 +491,65 @@ async function loadCatalog() {
 $("#btn-search").addEventListener("click", loadCatalog);
 $("#ingredient-search").addEventListener("keydown", (e) => {
   if (e.key === "Enter") loadCatalog();
+});
+
+/* ------------------------------------------- halal confirmation dialog */
+
+let halalIngredient = null;
+
+$("#catalog-body").addEventListener("click", (e) => {
+  const badge = e.target.closest("[data-halal]");
+  if (!badge) return;
+
+  halalIngredient = catalogRows.find(
+    (r) => r.ingredient_id == badge.dataset.halal);
+  if (!halalIngredient) return;
+
+  const r = halalIngredient;
+  $("#halal-product-name").textContent = r.canonical_name;
+  $("#halal-note").value = r.halal_note || "";
+  $$('#halal-form input[name="halal"]').forEach((i) => {
+    i.checked = i.value === r.halal_status;
+  });
+
+  const confirmed = r.halal_source === "user_confirmed";
+  $("#halal-derived").innerHTML = `
+    <div class="note ${confirmed ? "info" : ""}">
+      <span>${confirmed ? "🔒" : "🤖"}</span>
+      <div>${confirmed
+        ? "<strong>Confirmed by you.</strong> "
+        : "<strong>Derived automatically.</strong> "}
+        ${esc(r.halal_reason || "no reason recorded")}</div>
+    </div>`;
+  $("#halal-clear").classList.toggle("hidden", !confirmed);
+  $("#halal-dialog").showModal();
+});
+
+$("#halal-form").addEventListener("submit", async () => {
+  const choice = $('#halal-form input[name="halal"]:checked');
+  if (!choice) return;
+  try {
+    await api(`/api/ingredients/${halalIngredient.ingredient_id}/halal`, {
+      method: "PUT",
+      body: { halal_status: choice.value, note: $("#halal-note").value },
+    });
+    toast(`Saved — ${halalIngredient.canonical_name}`);
+    loadCatalog();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+});
+
+$("#halal-clear").addEventListener("click", async () => {
+  try {
+    await api(`/api/ingredients/${halalIngredient.ingredient_id}/halal`,
+              { method: "DELETE" });
+    toast("Confirmation cleared — re-run ingestion to re-derive");
+    $("#halal-dialog").close();
+    loadCatalog();
+  } catch (err) {
+    toast(err.message, "error");
+  }
 });
 
 /* -------------------------------------------------------------- pipeline */

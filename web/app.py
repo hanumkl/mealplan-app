@@ -431,6 +431,78 @@ def add_price(ingredient_id: int):
     return jsonify(row), 201
 
 
+@app.put("/api/ingredients/<int:ingredient_id>/halal")
+def confirm_halal(ingredient_id: int):
+    """Record the household's own halal decision for a product.
+
+    This outranks whatever the pipeline derived, and the ingestion notebook's
+    upsert preserves it on subsequent runs. For a halal filter the family is
+    the authority - a heuristic over crowd-sourced data isn't.
+    """
+    data = body()
+    status = data.get("halal_status")
+    if status not in ("certified", "likely_ok", "contains_flagged", "unknown"):
+        return bad_request(
+            "halal_status must be certified, likely_ok, contains_flagged or unknown"
+        )
+
+    note = (data.get("note") or "").strip() or None
+    reason = "confirmed by household" + (f": {note}" if note else "")
+
+    row = run_returning(
+        """
+        UPDATE ingredients
+           SET halal_status       = %s,
+               halal_reason       = %s,
+               halal_note         = %s,
+               halal_source       = 'user_confirmed',
+               halal_confirmed_at = now(),
+               updated_at         = now()
+         WHERE ingredient_id = %s
+        RETURNING *
+        """,
+        (status, reason, note, ingredient_id),
+    )
+    if row is None:
+        return jsonify({"error": "ingredient not found"}), 404
+    return jsonify(row)
+
+
+@app.delete("/api/ingredients/<int:ingredient_id>/halal")
+def clear_halal_confirmation(ingredient_id: int):
+    """Drop a manual confirmation and fall back to the derived value.
+
+    The derived status isn't recomputed here - it's restored on the next
+    ingestion run, so until then the product reads 'unknown'.
+    """
+    row = run_returning(
+        """
+        UPDATE ingredients
+           SET halal_source       = 'derived',
+               halal_confirmed_at = NULL,
+               halal_note         = NULL,
+               halal_status       = 'unknown',
+               halal_reason       = 'confirmation removed - rerun ingestion to re-derive',
+               updated_at         = now()
+         WHERE ingredient_id = %s
+        RETURNING *
+        """,
+        (ingredient_id,),
+    )
+    if row is None:
+        return jsonify({"error": "ingredient not found"}), 404
+    return jsonify(row)
+
+
+@app.get("/api/ingredients/needing-review")
+def ingredients_needing_review():
+    """Products the pipeline couldn't classify, for the household to decide on."""
+    limit = min(int(request.args.get("limit", 50)), 200)
+    return jsonify(run_query(
+        "SELECT * FROM ingredients_needing_halal_review LIMIT %s", (limit,)
+    ))
+
+
 @app.get("/api/stores")
 def list_stores():
     return jsonify(run_query("SELECT * FROM stores ORDER BY name"))
