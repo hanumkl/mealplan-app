@@ -11,3 +11,5 @@ env:
     value: "1"
   - name: AGENT_ENDPOINT
     value: "databricks-llama-4-maverick"
+  - name: AGENT_MAX_STEPS
+    value: "14"

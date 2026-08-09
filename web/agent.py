@@ -28,7 +28,10 @@ from units import price_for_grams, to_grams
 logger = logging.getLogger("mealplan.agent")
 
 AGENT_ENDPOINT = os.environ.get("AGENT_ENDPOINT", "databricks-llama-4-maverick")
-MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "6"))
+# A seven-day plan legitimately needs: household, history, a search or two,
+# a few recipe lookups, then the write. Six steps ran out before the write and
+# the user got an apology instead of a plan.
+MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "14"))
 
 SYSTEM_PROMPT = """You are the meal planner for a family in Finland.
 
@@ -54,6 +57,12 @@ HARD RULES:
 - Nutrition numbers are often partial because not every ingredient matched the
   price catalogue. When you quote a number that is based on partial data, say
   so.
+
+BE ECONOMICAL WITH TOOLS:
+One search with limit 15 beats five searches with limit 3. Do not call
+get_recipe on every candidate before planning - pick from the search results,
+write the plan, and only look up details if the user asks. Getting the plan
+saved matters more than checking every calorie first.
 
 CALLING TOOLS - read this twice:
 Never write a tool call as text. Do not type create_meal_plan(...) or describe
