@@ -927,6 +927,14 @@ async function openRecipe(recipeId, servings = null) {
         Assumes this dish covers lunch and dinner — about 65% of the day's
         calories. Breakfast and snacks are outside the plan.
       </div>
+      ${data.member_fit_reliable ? "" : `
+        <div class="note warn" style="margin-top:8px"><span>⚠️</span><div>
+          These portions are unreliable — the recipe's calories are based on
+          only ${data.totals.ingredients_counted} of
+          ${data.totals.ingredients_total} ingredients, so the per-serving
+          figure is too low and the multipliers come out too high. Match the
+          missing ingredients to fix it.
+        </div></div>`}
     </div>`;
 
   const videoId = r.video_id || "";

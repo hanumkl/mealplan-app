@@ -850,7 +850,12 @@ def recipe_nutrition_payload(recipe_id: int, servings: float | None = None):
             "cost_eur": (round(totals["cost_eur"] / effective_servings, 2)
                          if totals["cost_eur"] and effective_servings else None),
         },
+        # Portion maths divides by per-serving calories, so partial nutrition
+        # produces absurd answers - a recipe whose chicken didn't match showed
+        # "10.73x servings". Flagged rather than hidden: the shape of the
+        # calculation is still worth seeing, it just isn't a number to cook by.
         "member_fit": _member_fit(per_serving_kcal, per_serving_protein),
+        "member_fit_reliable": bool(totals["is_complete"]),
     }
 
 
