@@ -11,6 +11,55 @@ target.
 
 ---
 
+## What's actually in there
+
+Real numbers from the running system, not targets:
+
+| | |
+|---|---|
+| Products in the catalog | **8,491** Finnish items from Open Food Facts |
+| Receipts extracted | **20** PDFs and photos, 0.90–1.00 confidence |
+| Recipes harvested | **239** from YouTube, avg extraction confidence **0.91** |
+| Recipe ingredient lines | **4,265**, of which **~70%** matched to the priced catalog at ≥0.72 similarity |
+| Recipes flagged not-halal | **18** (2 pork, 16 alcohol) — caught automatically |
+| Vector embeddings | ingredients, recipes, recipe step-chunks, cooking log |
+
+---
+
+## Architecture
+
+```
+  Open Food Facts API ─┐
+  YouTube Data API v3 ─┼─► Spark notebooks ─► Volume (raw JSON, immutable)
+  Receipt PDFs/photos ─┘         │
+                                 ▼
+                        Lakebase (Postgres + pgvector)
+                    ┌────────────┴────────────┐
+                    │                         │
+         curated tables                embedding tables
+    households, members, goals      ingredient / recipe /
+    ingredients, prices, stores     chunk / cooking-log
+    recipes, plans, cooking_log       VECTOR(384) + HNSW
+                    │                         │
+                    └────────────┬────────────┘
+                                 │
+              ┌──────────────────┴──────────────────┐
+              ▼                                     ▼
+   web/  Databricks App                mcp_server/  Databricks App
+   Flask + hand-built UI               FastMCP over streamable HTTP
+   + in-process agent                  9 tools (3 write)
+   (web/agent.py)                      → Agent Bricks
+```
+
+Both apps read the same Lakebase. The agent exists twice on purpose: in-process
+in the web app so there's a working UI to demo, and as an MCP server so Agent
+Bricks can drive the same tools.
+
+**The loop this closes:** plan → cook → log what actually happened → that free
+text gets embedded → next week's planning retrieves it as context.
+
+---
+
 ## Capstone requirements
 
 | Requirement | How it's met |
@@ -32,7 +81,7 @@ Mirrors the bootcamp's three days. Each stage ends in something demoable.
 - **Stage 2 — Context engineering + vectors** ✅
   pgvector in Lakebase, YouTube recipe harvest, LLM ingredient extraction,
   semantic recipe search.
-- **Stage 3 — Agent** ← *you are here*
+- **Stage 3 — Agent** ✅
   A planning agent with tools that read the catalog **and write to it**:
   it commits the week's plan, logs what was actually cooked, and builds a
   priced grocery list. Runs in-process in the app (`web/agent.py`) on a
@@ -43,30 +92,46 @@ Mirrors the bootcamp's three days. Each stage ends in something demoable.
 ## Layout
 
 ```
-sql/                    schema, run once in file-number order
-  01_core.sql             households, members, goals, restrictions
-  02_catalog.sql          stores, ingredients, prices, raw landing tables
-  03_planning.sql         recipes, plans, portions, grocery lists, cooking log
-  04_seed.sql             a starting household — edit before running
-notebooks/              Spark jobs, run as Databricks Workflows
-  ingest_openfoodfacts.py
-  extract_receipts.py
-web/                    the Databricks App (Stage 1)
-  app.py                  Flask: JSON API + page
-  lakebase.py             Postgres connection helper
-  nutrition.py            Mifflin-St Jeor targets + recipe scaling
-  app.yaml                Databricks Apps config
-  templates/, static/     frontend
-setup_secrets.py        one-time secret setup
+sql/                          schema, run once in file-number order
+  01_core.sql                   households, members, goals, restrictions
+  02_catalog.sql                stores, ingredients, prices, raw landing tables
+  03_planning.sql               recipes, plans, portions, grocery, cooking log
+  04_seed.sql                   a starting household — edit before running
+  05_add_english_names.sql      English name + category for a Finnish catalog
+  06_halal_confirmation.sql     household override, outranks the pipeline
+  07_vectors.sql                pgvector tables, VECTOR(384) + HNSW
+  08_recipe_matching.sql        recipe → catalog link + match provenance
+
+notebooks/                    Spark jobs, run as Databricks Workflows
+  ingest_openfoodfacts.py       product catalog + dietary flag derivation
+  extract_receipts.py           PDF text + vision extraction from photos
+  harvest_youtube_recipes.py    video → structured ingredients via LLM
+  embed_content.py              everything → pgvector
+  match_recipe_ingredients.py   semantic recipe → catalog matching
+
+web/                          Databricks App #1 — the UI
+  app.py                        Flask: JSON API + page
+  agent.py                      the in-process agent, 7 tools, 3 write
+  embeddings.py                 query-side embedding, two backends
+  lakebase.py                   Postgres connection helper
+  nutrition.py                  Mifflin-St Jeor targets + recipe scaling
+  units.py                      recipe units → grams, honest about failures
+  app.yaml                      Databricks Apps config
+  templates/, static/           frontend, no build step
+
+mcp_server/                   Databricks App #2 — the MCP server
+  mealplan_mcp_server.py        thin @mcp.tool wrappers, docstrings only
+  mealplan_store.py             adapter: all SQL and derived logic
+  README.md                     tools, setup, Agent Bricks system prompt
+
+screenshots/                  demo evidence
+setup_secrets.py              one-time secret setup
 ```
 
-mcp_server/             the MCP server (Stage 3), deployed as a SECOND app
-  mealplan_mcp_server.py  thin @mcp.tool wrappers
-  mealplan_store.py       adapter: all SQL and derived logic
-  README.md               tools, setup, and the Agent Bricks system prompt
-
 Each Databricks App deploys from its own folder, which is why `web/` and
-`mcp_server/` are siblings.
+`mcp_server/` are siblings. The MCP split follows Day 3's
+`alpaca_mcp_server.py` / `alpaca_broker.py` pattern: **no database calls inside
+the tool functions**.
 
 ---
 
@@ -284,6 +349,91 @@ K-ruoka behind Cloudflare; Kesko's developer portal requires Azure AD partner
 credentials. Getting past the first two means defeating an anti-bot control,
 and it would be the flakiest thing in the stack. Your own receipts are better
 data anyway.
+
+---
+
+## The agent
+
+Seven tools in the app, nine in the MCP server. Three of them **write**.
+
+| Tool | Writes | What it does |
+|---|---|---|
+| `get_household` | | Members, targets, strict vs. preference restrictions |
+| `search_recipes` | | Semantic search; strict restrictions applied **in SQL** |
+| `get_recipe` | | Ingredients scaled to servings, nutrition, cost, coverage |
+| `get_cooking_history` | | What was really cooked, and why plans were abandoned |
+| `suggest_todays_meal` *(MCP)* | | Derived judgement — see below |
+| `create_meal_plan` | ✍️ | Commits a week to `meal_plans` + `meal_plan_items` |
+| `log_cooked` | ✍️ | Records reality into `cooking_log` |
+| `build_grocery_list` | ✍️ | Aggregates and prices a week's shopping |
+
+**Restrictions are enforced in SQL, not in the prompt.** A model can be talked
+out of an instruction; a `WHERE` clause can't. For a halal household that's the
+difference between a guardrail and a suggestion.
+
+**Invented IDs are refused.** `create_meal_plan` rejects `recipe_id`s that don't
+exist rather than writing a plan pointing at phantom recipes.
+
+**Narrated calls are caught.** Llama 4 Maverick sometimes replies *"I will
+commit a week's plan with create_meal_plan(...)"* as plain text without calling
+anything. The loop detects that and pushes back, because a described write that
+the user believes happened is the worst possible failure for a write tool.
+
+`suggest_todays_meal` is a judgement call, not a passthrough: strict
+restrictions in SQL, exclude anything cooked in the last N days, honour a time
+cap, then rank by closeness to the household's per-meal calorie need — and it
+reports which rules fired.
+
+---
+
+## Screenshots
+
+In [`screenshots/`](screenshots/):
+
+| | |
+|---|---|
+| `1_saved_plan.png` | Agent commits a week — green **write** chip, 7 days, plan panel filled |
+| `2_mealplan_adjusted.png` | Replanning the same week |
+| `3_cook_adjustment.png` | Logging a deviation → writes to `cooking_log` |
+| `4_ingredients_catalog.png` | 8,491 products, English hints, halal badges |
+| `5_recipes_embedding.png` | Semantic recipe search with match percentages |
+| `6_recipes_connect_video.png` | Recipe linked to its YouTube source |
+| `7_recipe.png` | Scaled ingredients, nutrition, cost, coverage |
+| `8_portion_calculation.png` | Per-member portions from one shared pot |
+| `9_household_goal.png` | Members, goals, strict vs. preference restrictions |
+| `10_pipeline_status.png` | Row counts proving the Spark jobs landed data |
+
+---
+
+## Known limitations
+
+Named here rather than left for a reviewer to find.
+
+**Quantity extraction is the weak link.** The LLM reading a video description
+sometimes invents quantities — 500 g of garlic in a gado-gado. Matching is
+solid (≥0.72 similarity, non-food lines excluded); it's the numbers next to the
+ingredients that are unreliable. The fix is a stricter extraction prompt forcing
+`quantity: null` unless a number is explicitly written, then a re-harvest.
+Consequence: some recipes show inflated calories, which is why every total
+carries its coverage and why portion multipliers are flagged when incomplete.
+
+**Duplicate dishes.** "Tempe Orek" and "Tempeh Orek" are the same dish with
+different spellings, and a week's plan can contain both. Real dedupe needs
+recipe-level identity — clustering on the ingredient vector — not title
+matching.
+
+**Halal is never auto-approved.** A video description can prove a recipe
+contains pork; it can never prove how the meat was slaughtered. Clean recipes
+read `unknown`, not "halal". The household confirms, and that confirmation
+outranks the pipeline and survives re-ingestion.
+
+**Prices are a floor.** They come from the household's own receipts, so they're
+real but dated, and anything unpriced is excluded from the total rather than
+guessed at.
+
+**Agent Bricks on Free Edition** is unverified. The MCP server deploys fine;
+whether Agent Bricks is offered on Free Edition should be checked. The in-app
+agent covers the same tools either way.
 
 ---
 
