@@ -1,0 +1,11 @@
+# Pinned to 1.x: FastMCP lives inside `mcp` there, which is the Day 3
+# pattern. mcp 2.0 split it into a standalone `fastmcp` package.
+mcp>=1.2.0,<2.0.0
+databricks-sdk>=0.30.0
+psycopg2-binary>=2.9.9
+
+# Semantic recipe search. If torch can't be installed in the app image the
+# server still runs - search degrades to keyword matching and says so in the
+# response, rather than failing.
+sentence-transformers>=3.0.0
+torch>=2.2.0

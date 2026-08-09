@@ -1,0 +1,11 @@
+command:
+  - "python"
+  - "mealplan_mcp_server.py"
+
+env:
+  - name: LAKEBASE_SECRET_SCOPE
+    value: "mealplan"
+  - name: LAKEBASE_SECRET_KEY
+    value: "lakebase-url"
+  - name: DEFAULT_HOUSEHOLD_ID
+    value: "1"

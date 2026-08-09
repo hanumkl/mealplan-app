@@ -19,7 +19,7 @@ target.
 | Third-party API | Open Food Facts (free, no key) — plus YouTube Data API v3 in Stage 2 |
 | Unstructured data | **Receipt photographs** via vision extraction, plus YouTube video descriptions → structured ingredient lines in Stage 2 |
 | Databricks App with frontend | `web/` — Flask + a hand-built frontend, no Streamlit |
-| AI agent that does stuff | `web/agent.py` — 7 tools, 3 of which write: `create_meal_plan`, `log_cooked`, `build_grocery_list`. The UI shows which calls were writes. |
+| AI agent that does stuff | `mcp_server/` — FastMCP server as its own Databricks App, 9 tools of which 3 write, for Agent Bricks. Also driven in-app by `web/agent.py` (Planner tab), which shows which calls were writes. |
 
 ---
 
@@ -60,8 +60,13 @@ web/                    the Databricks App (Stage 1)
 setup_secrets.py        one-time secret setup
 ```
 
-Stage 3's `mcp_server/` becomes a sibling of `web/` — each Databricks App
-deploys from its own folder, which is why the split exists now.
+mcp_server/             the MCP server (Stage 3), deployed as a SECOND app
+  mealplan_mcp_server.py  thin @mcp.tool wrappers
+  mealplan_store.py       adapter: all SQL and derived logic
+  README.md               tools, setup, and the Agent Bricks system prompt
+
+Each Databricks App deploys from its own folder, which is why `web/` and
+`mcp_server/` are siblings.
 
 ---
 
