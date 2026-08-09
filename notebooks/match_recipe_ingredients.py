@@ -35,7 +35,12 @@
 dbutils.widgets.text("model_name",
                      "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
                      "Embedding model (must match embed_content.py)")
-dbutils.widgets.text("threshold", "0.55", "Minimum similarity to accept a match")
+# 0.55 was too loose: it matched "thyme" to Pölsa (a meat dish), "cumin
+# powder" to Enchilada Sauce and "stock cube" to soy texture cubes. Those are
+# small quantities so the calorie damage is limited, but a recipe that shows
+# them looks untrustworthy - and rightly so. 0.72 keeps the matches you'd
+# defend and leaves the rest visibly unmatched.
+dbutils.widgets.text("threshold", "0.72", "Minimum similarity to accept a match")
 dbutils.widgets.text("nutrition_margin", "0.10",
                      "Prefer a nutrition-bearing match within this of the best")
 dbutils.widgets.text("batch_size", "256", "Encode batch size")
@@ -139,6 +144,36 @@ TRAILING_NOTE = re.compile(
 )
 
 
+# Equipment and non-food lines that the LLM extracts alongside real
+# ingredients. Left to the vector search these match *something* - a bamboo
+# stick lands on "Surimi Crab Sticks", a toothpick on "Crepes dentelles" -
+# because nearest-neighbour always returns a nearest neighbour. There is no
+# similarity threshold that fixes this: the right answer is "no match exists",
+# which a ranking can't express.
+NON_FOOD = [
+    "toothpick", "skewer", "bamboo stick", "banana leaf", "baking paper",
+    "parchment", "foil", "aluminium", "aluminum", "cling film", "plastic wrap",
+    "string", "twine", "tusuk gigi", "tusuk sate", "daun pisang", "lidi",
+    "kertas", "plastik", "water", "air putih", "ice cube", "es batu",
+    "cooking oil for frying", "minyak untuk menggoreng",
+]
+
+
+def is_non_food(text: str) -> bool:
+    """Word-boundary matching, not substring.
+
+    Substring matching flags 'watermelon' as non-food because it contains
+    'water' - the same trap that once flagged couscous as alcoholic for
+    containing 'rum'. Multi-word tokens still work; the boundary is applied at
+    each end of the whole phrase.
+    """
+    low = (text or "").lower()
+    return any(
+        re.search(rf"(?:^|[^a-z0-9]){re.escape(token)}(?:[^a-z0-9]|$)", low)
+        for token in NON_FOOD
+    )
+
+
 def match_text(row: dict) -> str:
     name = (row.get("ingredient_name") or "").strip()
     if name:
@@ -182,6 +217,9 @@ if pending:
     with psycopg2.connect(LAKEBASE_URL, cursor_factory=RealDictCursor) as conn:
         with conn.cursor() as cur:
             for row, text, vec in zip(pending, texts, vectors):
+                if is_non_food(text):
+                    results.append((row, text, None, None))
+                    continue
                 lit = str(vec.tolist())
                 cur.execute(SEARCH, (lit, lit))
                 candidates = cur.fetchall()
@@ -244,6 +282,29 @@ if matched:
                 template="(%s::int, %s::int, %s::numeric)", page_size=200)
         conn.commit()
     print(f"wrote {len(matched)} matches")
+
+# Anything rejected this time must have its previous match cleared, not merely
+# skipped. Otherwise re-running with a stricter threshold is a no-op for
+# exactly the rows it was meant to fix: the old bad match survives untouched
+# and the run looks like it worked.
+if rejected:
+    stale = [(r[0]["ri_id"],) for r in rejected]
+    with psycopg2.connect(LAKEBASE_URL) as conn:
+        with conn.cursor() as cur:
+            execute_values(cur, """
+                UPDATE recipe_ingredients ri
+                SET ingredient_id    = NULL,
+                    match_confidence = NULL,
+                    match_method     = 'none',
+                    matched_at       = now()
+                FROM (VALUES %s) AS v(ri_id)
+                WHERE ri.ri_id = v.ri_id
+                  AND ri.match_method <> 'manual'
+                  AND ri.ingredient_id IS NOT NULL
+            """, stale, template="(%s::int)", page_size=200)
+            cleared = cur.rowcount
+        conn.commit()
+    print(f"cleared {cleared} matches that no longer meet the threshold")
 
 # COMMAND ----------
 
