@@ -36,12 +36,9 @@
         <span class="ico">🔍</span> Recipes
       </button>
 
-      <div class="nav-label" style="margin-top:16px">Coming next</div>
-      <button class="nav-item disabled" disabled>
-        <span class="ico">📅</span> Week plan <span class="stage-tag">S3</span>
-      </button>
-      <button class="nav-item disabled" disabled>
-        <span class="ico">🔥</span> Cook mode <span class="stage-tag">S3</span>
+      <div class="nav-label" style="margin-top:16px">Stage 3</div>
+      <button class="nav-item" data-view="plan">
+        <span class="ico">🤖</span> Planner
       </button>
     </nav>
 
@@ -140,6 +137,44 @@
       </div>
 
       <div id="recipes-body"></div>
+    </section>
+
+    <!-- ============================== PLAN =============================== -->
+    <section id="view-plan" class="hidden">
+      <div class="page-head">
+        <h1 class="page-title">Planner</h1>
+        <p class="page-sub">
+          An agent with tools that read your catalog <em>and</em> write to it —
+          it commits the week's plan, records what you actually cooked, and
+          builds a priced shopping list.
+        </p>
+      </div>
+
+      <div class="planner-grid">
+        <div class="card chat-card">
+          <div id="chat-log" class="chat-log">
+            <div class="chat-msg assistant">
+              <div class="chat-bubble">
+                Tell me what kind of week you want and I'll plan it — seven
+                dishes, one cooked each morning to cover lunch and dinner.
+                <div class="chat-suggestions">
+                  <button class="chip" data-ask="Plan next week for us. Mix Indonesian and something quick for weeknights.">Plan next week</button>
+                  <button class="chip" data-ask="What should I cook today that fits everyone's goals?">What today?</button>
+                  <button class="chip" data-ask="Build the grocery list for the current plan and tell me the total.">Grocery list</button>
+                  <button class="chip" data-ask="I was too tired to cook the planned meal today, we had instant noodles instead.">Log a deviation</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="chat-input-row">
+            <input type="text" id="chat-input"
+                   placeholder="Ask the planner…" autocomplete="off">
+            <button class="btn btn-primary" id="btn-chat-send">Send</button>
+          </div>
+        </div>
+
+        <div id="plan-body"></div>
+      </div>
     </section>
 
   </main>

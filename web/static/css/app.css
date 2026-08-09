@@ -526,6 +526,52 @@ dialog.dialog-wide { max-width: 620px; width: calc(100vw - 32px); }
   border-top: 1px solid var(--border);
 }
 
+/* ---- planner / agent (Stage 3) ---- */
+.planner-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+@media (max-width: 1100px) { .planner-grid { grid-template-columns: 1fr; } }
+
+.chat-card { display: flex; flex-direction: column; gap: 10px; position: sticky; top: 20px; }
+.chat-log {
+  display: flex; flex-direction: column; gap: 10px;
+  max-height: 58vh; overflow-y: auto; padding-right: 4px;
+}
+.chat-msg { display: flex; }
+.chat-msg.user { justify-content: flex-end; }
+.chat-bubble {
+  max-width: 88%; padding: 10px 13px; border-radius: var(--radius);
+  font-size: 13.5px; line-height: 1.55;
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+.chat-msg.user .chat-bubble {
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}
+.chat-input-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+.thinking { color: var(--text-muted); font-style: italic; }
+
+.chat-suggestions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.chip {
+  font-size: 12px; padding: 5px 10px; border-radius: 999px; cursor: pointer;
+  background: var(--surface); border: 1px solid var(--border-strong);
+  color: var(--text);
+}
+.chip:hover { border-color: var(--accent); color: var(--accent); }
+
+.tool-trace { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
+.tool-chip {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+/* Writes look different on purpose - a saved plan is not the same event as a
+   search, and the user should be able to see which happened. */
+.tool-chip.write {
+  background: var(--green-soft); border-color: var(--green); color: var(--green);
+  font-weight: 600;
+}
+.tool-chip.failed {
+  background: var(--red-soft); border-color: var(--red); color: var(--red);
+}
+
 .match-option { cursor: pointer; }
 .match-option:hover { background: var(--accent-soft); }
 

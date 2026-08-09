@@ -19,7 +19,7 @@ target.
 | Third-party API | Open Food Facts (free, no key) — plus YouTube Data API v3 in Stage 2 |
 | Unstructured data | **Receipt photographs** via vision extraction, plus YouTube video descriptions → structured ingredient lines in Stage 2 |
 | Databricks App with frontend | `web/` — Flask + a hand-built frontend, no Streamlit |
-| AI agent that does stuff | Stage 3: MCP server with read *and* write tools, driven by Agent Bricks |
+| AI agent that does stuff | `web/agent.py` — 7 tools, 3 of which write: `create_meal_plan`, `log_cooked`, `build_grocery_list`. The UI shows which calls were writes. |
 
 ---
 
@@ -29,12 +29,14 @@ Mirrors the bootcamp's three days. Each stage ends in something demoable.
 
 - **Stage 1 — App + Lakebase** ✅
   Household setup, ingredient catalog, price provenance, pipeline status.
-- **Stage 2 — Context engineering + vectors** ← *you are here*
+- **Stage 2 — Context engineering + vectors** ✅
   pgvector in Lakebase, YouTube recipe harvest, LLM ingredient extraction,
   semantic recipe search.
-- **Stage 3 — Agent**
-  FastMCP server as a second Databricks App, Agent Bricks agent, cook mode,
-  cooking log, and the Spark behaviour job over Lakebase CDF history.
+- **Stage 3 — Agent** ← *you are here*
+  A planning agent with tools that read the catalog **and write to it**:
+  it commits the week's plan, logs what was actually cooked, and builds a
+  priced grocery list. Runs in-process in the app (`web/agent.py`) on a
+  Databricks Foundation Model endpoint.
 
 ---
 

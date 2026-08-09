@@ -71,11 +71,12 @@ $$(".nav-item[data-view]").forEach((btn) => {
     $$(".nav-item").forEach((b) => b.classList.remove("active"));
     btn.classList.add("active");
     const view = btn.dataset.view;
-    ["household", "catalog", "pipeline", "recipes"].forEach((v) =>
+    ["household", "catalog", "pipeline", "recipes", "plan"].forEach((v) =>
       $(`#view-${v}`).classList.toggle("hidden", v !== view));
     if (view === "catalog") loadCatalog();
     if (view === "pipeline") loadPipeline();
     if (view === "recipes") loadRecipes();
+    if (view === "plan") loadPlan();
   });
 });
 
@@ -1134,6 +1135,169 @@ async function setReview(status) {
 
 $("#recipe-approve").addEventListener("click", () => setReview("approved"));
 $("#recipe-reject").addEventListener("click", () => setReview("rejected"));
+
+/* ------------------------------------------------------------ the agent */
+
+const chatHistory = [];
+let chatBusy = false;
+
+const TOOL_LABELS = {
+  get_household: "read your household",
+  search_recipes: "searched recipes",
+  get_recipe: "read a recipe",
+  get_cooking_history: "read cooking history",
+  create_meal_plan: "saved the week's plan",
+  log_cooked: "logged what you cooked",
+  build_grocery_list: "built the grocery list",
+};
+
+function addChatMessage(role, html) {
+  const el = document.createElement("div");
+  el.className = `chat-msg ${role}`;
+  el.innerHTML = `<div class="chat-bubble">${html}</div>`;
+  $("#chat-log").appendChild(el);
+  $("#chat-log").scrollTop = $("#chat-log").scrollHeight;
+  return el;
+}
+
+// Writes are shown explicitly. The user shouldn't have to take the model's
+// word for it that something was saved.
+const traceHtml = (trace) => !trace?.length ? "" : `
+  <div class="tool-trace">
+    ${trace.map((t) => `
+      <span class="tool-chip ${t.is_write ? "write" : ""} ${t.ok ? "" : "failed"}">
+        ${t.is_write ? "✎" : "🔎"} ${esc(TOOL_LABELS[t.tool] || t.tool)}
+        ${t.ok ? "" : " (failed)"}
+      </span>`).join("")}
+  </div>`;
+
+async function sendAgentMessage(text) {
+  if (chatBusy || !text.trim()) return;
+  chatBusy = true;
+  $("#chat-input").value = "";
+  addChatMessage("user", esc(text));
+  chatHistory.push({ role: "user", content: text });
+
+  const thinking = addChatMessage("assistant",
+    `<span class="thinking">Thinking… this can take a few seconds per step.</span>`);
+
+  try {
+    const res = await api("/api/agent/chat", {
+      method: "POST",
+      body: { messages: chatHistory },
+    });
+    thinking.remove();
+    addChatMessage("assistant",
+      esc(res.reply).replace(/\n/g, "<br>") + traceHtml(res.trace));
+    chatHistory.push({ role: "assistant", content: res.reply });
+
+    // A write means the plan on the right is now stale.
+    if (res.trace?.some((t) => t.is_write && t.ok)) loadPlan();
+  } catch (err) {
+    thinking.remove();
+    addChatMessage("assistant",
+      `<span style="color:var(--red)">${esc(err.message)}</span>`);
+  } finally {
+    chatBusy = false;
+  }
+}
+
+$("#btn-chat-send").addEventListener("click", () => sendAgentMessage($("#chat-input").value));
+$("#chat-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") sendAgentMessage($("#chat-input").value);
+});
+$("#chat-log").addEventListener("click", (e) => {
+  const chip = e.target.closest("[data-ask]");
+  if (chip) sendAgentMessage(chip.dataset.ask);
+});
+
+async function loadPlan() {
+  const body = $("#plan-body");
+  let data;
+  try {
+    data = await api("/api/plans/current");
+  } catch (err) {
+    body.innerHTML = `<div class="note warn"><span>⚠️</span><div>${esc(err.message)}</div></div>`;
+    return;
+  }
+
+  if (!data.plan) {
+    body.innerHTML = `
+      <div class="empty">
+        <div class="empty-icon">📅</div>
+        <div class="empty-title">No plan yet</div>
+        <div class="empty-sub">Ask the planner to build one.</div>
+      </div>`;
+    return;
+  }
+
+  const dayName = (d) => new Date(d).toLocaleDateString("en-GB",
+    { weekday: "short", day: "numeric", month: "short" });
+
+  const g = data.grocery;
+  body.innerHTML = `
+    <div class="card">
+      <div class="section-head" style="margin-top:0">
+        <h2 class="section-title">Week of ${esc(String(data.plan.week_start))}</h2>
+        <span class="badge ${data.plan.status === "active" ? "ok" : ""}">${esc(data.plan.status)}</span>
+      </div>
+      ${data.plan.rationale
+        ? `<div class="note info"><span>🤖</span><div>${esc(data.plan.rationale)}</div></div>`
+        : ""}
+
+      <table class="ingr-table">
+        <tbody>
+          ${data.days.map((d) => `
+            <tr>
+              <td class="ingr-qty" style="white-space:nowrap">${esc(dayName(d.plan_date))}</td>
+              <td>
+                <div>${esc(d.title || "—")}</div>
+                <div class="faint" style="font-size:11.5px">
+                  ${d.cuisine ? esc(d.cuisine) : ""}${d.duration_min ? ` · ${d.duration_min} min` : ""}
+                  ${d.notes ? ` · ${esc(d.notes)}` : ""}
+                </div>
+                ${d.log_id ? `
+                  <div class="faint" style="font-size:11.5px;color:${d.was_planned ? "var(--green)" : "var(--amber)"}">
+                    ${d.was_planned ? "✓ cooked as planned"
+                      : `↺ actually made ${esc(d.actually_cooked || "something else")}${
+                          d.deviation_reason ? ` — “${esc(d.deviation_reason)}”` : ""}`}
+                  </div>` : ""}
+              </td>
+              <td class="num">
+                ${d.recipe_id ? `<button class="btn btn-sm" data-recipe="${d.recipe_id}">open</button>` : ""}
+              </td>
+            </tr>`).join("")}
+        </tbody>
+      </table>
+    </div>
+
+    ${g ? `
+      <div class="card" style="margin-top:14px">
+        <div class="section-head" style="margin-top:0">
+          <h2 class="section-title">Grocery list</h2>
+          <span class="nutri-value">€${num(g.total_eur, 2)}</span>
+        </div>
+        <div class="faint" style="font-size:12px;margin-bottom:8px">
+          ${g.items} items. Prices come from your own receipts — an estimate, and
+          a floor: anything we couldn't price isn't in this total.
+        </div>
+        <table class="ingr-table"><tbody>
+          ${data.grocery_items.map((i) => `
+            <tr>
+              <td>${esc(i.display_name)}</td>
+              <td class="faint" style="font-size:11.5px">${esc(i.store_name || "—")}</td>
+              <td class="num ingr-qty">${i.est_price_eur !== null && i.est_price_eur !== undefined
+                ? "€" + num(i.est_price_eur, 2)
+                : '<span class="badge warn">no price</span>'}</td>
+            </tr>`).join("")}
+        </tbody></table>
+      </div>` : ""}`;
+}
+
+$("#plan-body").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-recipe]");
+  if (btn) openRecipe(Number(btn.dataset.recipe));
+});
 
 /* ---------------------------------------------------------------- health */
 

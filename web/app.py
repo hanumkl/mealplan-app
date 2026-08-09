@@ -794,16 +794,14 @@ def _member_fit(per_serving_kcal: float, per_serving_protein: float) -> list[dic
     return out
 
 
-@app.get("/api/recipes/<int:recipe_id>")
-def recipe_detail(recipe_id: int):
-    """Full recipe: ingredients scaled to the requested servings, plus the
-    nutrition and cost that the catalogue match makes possible."""
+def recipe_nutrition_payload(recipe_id: int, servings: float | None = None):
+    """Recipe + scaled ingredients + nutrition/cost. Shared by the REST
+    endpoint and the agent's get_recipe tool, so both see the same numbers."""
     recipe = run_one("SELECT * FROM recipes WHERE recipe_id = %s", (recipe_id,))
     if recipe is None:
-        return jsonify({"error": "recipe not found"}), 404
+        return {"error": "recipe not found"}
 
     base = float(recipe.get("base_servings") or 4)
-    servings = request.args.get("servings", type=float)
     factor = (servings / base) if servings and base else 1.0
 
     ingredients = run_query(
@@ -839,7 +837,7 @@ def recipe_detail(recipe_id: int):
     per_serving_protein = (totals["protein_g"] / effective_servings
                            if effective_servings else 0)
 
-    return jsonify({
+    return {
         "recipe": recipe,
         "ingredients": ingredients,
         "servings": effective_servings,
@@ -853,7 +851,15 @@ def recipe_detail(recipe_id: int):
                          if totals["cost_eur"] and effective_servings else None),
         },
         "member_fit": _member_fit(per_serving_kcal, per_serving_protein),
-    })
+    }
+
+
+@app.get("/api/recipes/<int:recipe_id>")
+def recipe_detail(recipe_id: int):
+    payload = recipe_nutrition_payload(recipe_id, request.args.get("servings", type=float))
+    if "error" in payload:
+        return jsonify(payload), 404
+    return jsonify(payload)
 
 
 @app.put("/api/recipe-ingredients/<int:ri_id>/match")
@@ -1014,6 +1020,92 @@ def search_status():
             _embedding_model_warning("ingredient_embeddings"),
         ) if w],
     })
+
+
+# --------------------------------------------------------------------------
+# the agent (Stage 3)
+# --------------------------------------------------------------------------
+
+@app.post("/api/agent/chat")
+def agent_chat():
+    """Run the planning agent. Tools read the catalogue and write real rows:
+    meal plans, cooking-log entries and grocery lists."""
+    messages = body().get("messages")
+    if not isinstance(messages, list) or not messages:
+        return bad_request("messages must be a non-empty list")
+
+    clean = [
+        {"role": m["role"], "content": str(m.get("content") or "")}
+        for m in messages
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+    ][-12:]                       # keep the context window bounded
+    if not clean:
+        return bad_request("no usable messages")
+
+    import agent
+    try:
+        return jsonify(agent.chat(clean, DEFAULT_HOUSEHOLD_ID))
+    except Exception as exc:
+        app.logger.exception("agent failed")
+        return jsonify({
+            "error": f"{type(exc).__name__}: {exc}",
+            "hint": f"Check the '{agent.AGENT_ENDPOINT}' serving endpoint "
+                    f"exists and supports tool calling.",
+        }), 502
+
+
+@app.get("/api/plans/current")
+def current_plan():
+    """The most recent plan, with each day's dish and its numbers."""
+    plan = run_one(
+        """
+        SELECT * FROM meal_plans WHERE household_id = %s
+        ORDER BY week_start DESC LIMIT 1
+        """,
+        (DEFAULT_HOUSEHOLD_ID,),
+    )
+    if plan is None:
+        return jsonify({"plan": None, "days": [], "grocery": None})
+
+    days = run_query(
+        """
+        SELECT i.item_id, i.plan_date, i.recipe_id, i.base_servings, i.notes,
+               r.title, r.cuisine, r.duration_min, r.thumbnail_url, r.video_id,
+               r.halal_status, r.is_vegetarian, r.contains_pork,
+               l.log_id, l.was_planned, l.deviation_reason,
+               a.title AS actually_cooked
+        FROM meal_plan_items i
+        LEFT JOIN recipes r ON r.recipe_id = i.recipe_id
+        LEFT JOIN cooking_log l ON l.household_id = %s AND l.cooked_date = i.plan_date
+        LEFT JOIN recipes a ON a.recipe_id = l.actual_recipe_id
+        WHERE i.plan_id = %s
+        ORDER BY i.plan_date
+        """,
+        (DEFAULT_HOUSEHOLD_ID, plan["plan_id"]),
+    )
+
+    grocery = run_one(
+        """
+        SELECT g.list_id, g.total_eur,
+               (SELECT COUNT(*) FROM grocery_items gi WHERE gi.list_id = g.list_id) AS items
+        FROM grocery_lists g WHERE g.plan_id = %s
+        """,
+        (plan["plan_id"],),
+    )
+    items = run_query(
+        """
+        SELECT gi.display_name, gi.quantity, gi.unit, gi.est_price_eur,
+               gi.price_source, s.name AS store_name
+        FROM grocery_items gi
+        LEFT JOIN stores s ON s.store_id = gi.store_id
+        WHERE gi.list_id = %s
+        ORDER BY s.name NULLS LAST, gi.est_price_eur DESC NULLS LAST
+        """,
+        (grocery["list_id"],),
+    ) if grocery else []
+
+    return jsonify({"plan": plan, "days": days, "grocery": grocery,
+                    "grocery_items": items})
 
 
 # --------------------------------------------------------------------------
