@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 
 import embeddings
 from lakebase import run_one, run_query, run_returning, run_write
@@ -54,10 +55,39 @@ HARD RULES:
   price catalogue. When you quote a number that is based on partial data, say
   so.
 
+CALLING TOOLS - read this twice:
+Never write a tool call as text. Do not type create_meal_plan(...) or describe
+the arguments you "will" use. Actually invoke the tool. Saying you will save a
+plan does not save it, and the user will believe you did.
+If you have the information you need, call the tool now rather than announcing
+it.
+
 STYLE:
-Be brief and concrete. The user is cooking, not reading. Before writing
-anything to the database, say what you are about to do in one line.
+Be brief and concrete. The user is cooking, not reading.
 """
+
+
+def _dated_prompt() -> str:
+    """The model has no clock. Without this it plans for whatever year it
+    happens to imagine - it picked 2024 on the first real run."""
+    from datetime import date, timedelta
+
+    today = date.today()
+    next_monday = today + timedelta(days=(7 - today.weekday()) % 7 or 7)
+    return (
+        f"{SYSTEM_PROMPT}\n"
+        f"TODAY IS {today.isoformat()} ({today.strftime('%A')}).\n"
+        f"'Next week' starts Monday {next_monday.isoformat()}.\n"
+        f"'This week' starts Monday "
+        f"{(today - timedelta(days=today.weekday())).isoformat()}.\n"
+        f"Never use a date you did not derive from these.\n"
+    )
+
+
+# Matches an assistant that typed a tool call instead of making one.
+_NARRATED_CALL = re.compile(
+    r"\b(create_meal_plan|log_cooked|build_grocery_list|search_recipes|"
+    r"get_recipe|get_household|get_cooking_history)\s*\(", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # tool schemas
@@ -592,8 +622,9 @@ def chat(messages: list[dict], household_id: int) -> dict:
     can show that a write actually happened rather than asking the user to
     take the model's word for it.
     """
-    convo = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+    convo = [{"role": "system", "content": _dated_prompt()}] + messages
     trace = []
+    nudges = 0
 
     for _step in range(MAX_STEPS):
         data = _invoke({
@@ -610,7 +641,24 @@ def chat(messages: list[dict], household_id: int) -> dict:
         calls = choice.get("tool_calls") or []
 
         if not calls:
-            return {"reply": choice.get("content") or "", "trace": trace,
+            content = choice.get("content") or ""
+
+            # Llama sometimes types the tool call instead of making it:
+            # "I will commit a week's plan with create_meal_plan(...)". The
+            # user reads that as done, and nothing was written. Push back once
+            # rather than letting a described write pass for a real one.
+            if _NARRATED_CALL.search(content) and nudges < 2:
+                nudges += 1
+                convo.append({"role": "assistant", "content": content})
+                convo.append({
+                    "role": "user",
+                    "content": "You described a tool call instead of making "
+                               "one, so nothing was saved. Invoke the tool "
+                               "now, with no explanation.",
+                })
+                continue
+
+            return {"reply": content, "trace": trace,
                     "endpoint": AGENT_ENDPOINT}
 
         convo.append({
