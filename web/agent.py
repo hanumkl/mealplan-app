@@ -524,9 +524,61 @@ WRITE_TOOLS = {"create_meal_plan", "log_cooked", "build_grocery_list"}
 # the loop
 # ---------------------------------------------------------------------------
 
-def _client():
+class AgentEndpointError(RuntimeError):
+    pass
+
+
+def _auth_headers() -> tuple[str, dict]:
+    """(host, headers) for calling a serving endpoint.
+
+    Deliberately not `serving_endpoints.get_open_ai_client()` - that helper
+    doesn't exist in every databricks-sdk version, and the one the app image
+    ships with is not ours to choose. The REST path is stable and the payload
+    is OpenAI-shaped either way.
+    """
     from databricks.sdk import WorkspaceClient
-    return WorkspaceClient().serving_endpoints.get_open_ai_client()
+
+    w = WorkspaceClient()
+    host = (w.config.host or "").rstrip("/")
+
+    headers = {}
+    try:
+        # Works for both PAT and the OAuth service principal used by Apps.
+        headers = dict(w.config.authenticate() or {})
+    except Exception:  # noqa: BLE001
+        pass
+    if "Authorization" not in headers and getattr(w.config, "token", None):
+        headers["Authorization"] = f"Bearer {w.config.token}"
+    if "Authorization" not in headers:
+        raise AgentEndpointError(
+            "Could not obtain Databricks credentials for the serving endpoint."
+        )
+    headers["Content-Type"] = "application/json"
+    return host, headers
+
+
+def _invoke(payload: dict) -> dict:
+    """POST an OpenAI-style chat payload to the serving endpoint."""
+    import requests
+
+    host, headers = _auth_headers()
+    url = f"{host}/serving-endpoints/{AGENT_ENDPOINT}/invocations"
+    resp = requests.post(url, headers=headers, json=payload, timeout=180)
+
+    if resp.status_code == 404:
+        raise AgentEndpointError(
+            f"Serving endpoint '{AGENT_ENDPOINT}' not found. Set AGENT_ENDPOINT "
+            f"in app.yaml to one that exists in this workspace."
+        )
+    if resp.status_code == 429:
+        raise AgentEndpointError(
+            "The model endpoint is rate-limiting. Wait a few seconds and retry."
+        )
+    if resp.status_code >= 400:
+        raise AgentEndpointError(
+            f"{AGENT_ENDPOINT} returned {resp.status_code}: {resp.text[:400]}"
+        )
+    return resp.json()
 
 
 def _json_default(obj):
@@ -540,42 +592,51 @@ def chat(messages: list[dict], household_id: int) -> dict:
     can show that a write actually happened rather than asking the user to
     take the model's word for it.
     """
-    client = _client()
     convo = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
     trace = []
 
     for _step in range(MAX_STEPS):
-        response = client.chat.completions.create(
-            model=AGENT_ENDPOINT,
-            messages=convo,
-            tools=TOOLS,
-            tool_choice="auto",
-            max_tokens=1600,
-        )
-        choice = response.choices[0].message
-        calls = getattr(choice, "tool_calls", None)
+        data = _invoke({
+            "messages": convo,
+            "tools": TOOLS,
+            "tool_choice": "auto",
+            "max_tokens": 1600,
+        })
+        choices = data.get("choices") or []
+        if not choices:
+            raise AgentEndpointError(f"empty response from {AGENT_ENDPOINT}")
+
+        choice = choices[0].get("message", {})
+        calls = choice.get("tool_calls") or []
 
         if not calls:
-            return {"reply": choice.content or "", "trace": trace,
+            return {"reply": choice.get("content") or "", "trace": trace,
                     "endpoint": AGENT_ENDPOINT}
 
         convo.append({
             "role": "assistant",
-            "content": choice.content or "",
+            "content": choice.get("content") or "",
             "tool_calls": [
-                {"id": c.id, "type": "function",
-                 "function": {"name": c.function.name,
-                              "arguments": c.function.arguments}}
+                {"id": c.get("id"), "type": "function",
+                 "function": {"name": c.get("function", {}).get("name"),
+                              "arguments": c.get("function", {}).get("arguments") or "{}"}}
                 for c in calls
             ],
         })
 
         for call in calls:
-            name = call.function.name
-            try:
-                args = json.loads(call.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
+            fn = call.get("function", {})
+            name = fn.get("name")
+            raw_args = fn.get("arguments")
+            # Some models return arguments already decoded rather than as a
+            # JSON string, so accept both shapes.
+            if isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                try:
+                    args = json.loads(raw_args or "{}")
+                except json.JSONDecodeError:
+                    args = {}
 
             impl = TOOL_IMPLS.get(name)
             if impl is None:
@@ -595,7 +656,7 @@ def chat(messages: list[dict], household_id: int) -> dict:
                           "ok": "error" not in (result if isinstance(result, dict) else {})})
             convo.append({
                 "role": "tool",
-                "tool_call_id": call.id,
+                "tool_call_id": call.get("id"),
                 "content": json.dumps(result, default=_json_default)[:12000],
             })
 

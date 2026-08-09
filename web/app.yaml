@@ -9,3 +9,5 @@ env:
     value: "lakebase-url"
   - name: DEFAULT_HOUSEHOLD_ID
     value: "1"
+  - name: AGENT_ENDPOINT
+    value: "databricks-llama-4-maverick"
